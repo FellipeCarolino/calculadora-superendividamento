@@ -434,7 +434,19 @@ def extract_contrato():
 
 @app.route("/api/health")
 def health():
-    return jsonify({"ok": True, "model": MODEL, "tem_chave": bool(os.environ.get("ANTHROPIC_API_KEY"))})
+    try:
+        dialect = db.engine.dialect.name  # "postgresql" (permanente) ou "sqlite" (temporário)
+    except Exception:
+        dialect = "?"
+    try:
+        total_contas = User.query.count()
+    except Exception:
+        total_contas = None
+    return jsonify({
+        "ok": True, "model": MODEL,
+        "tem_chave": bool(os.environ.get("ANTHROPIC_API_KEY")),
+        "banco": dialect, "contas": total_contas,
+    })
 
 
 # ============================================================
