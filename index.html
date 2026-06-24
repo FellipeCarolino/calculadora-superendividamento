@@ -812,6 +812,13 @@
 </head>
 <body>
 
+<div id="contaBar" style="display:none;background:#13283e;color:#fff;padding:8px 20px;font-size:0.85rem;display:none;align-items:center;gap:14px;justify-content:flex-end">
+  <span id="contaUso" style="background:rgba(255,255,255,0.12);padding:4px 12px;border-radius:14px"></span>
+  <span id="contaNome"></span>
+  <a id="contaAdmin" href="/admin" style="color:#f0b429;text-decoration:none;font-weight:600;display:none">Admin</a>
+  <a href="/logout" style="color:#fff;text-decoration:none;opacity:0.85">Sair ↪</a>
+</div>
+
 <header>
   <div class="logo-icon">⚖️</div>
   <div>
@@ -1926,6 +1933,7 @@
       iaStatus('iaHoleriteStatus', 'erro', msg);
     } finally {
       input.value = '';
+      carregarConta();
     }
   }
 
@@ -1954,6 +1962,7 @@
       iaStatus(statusId, 'erro', msg);
     } finally {
       input.value = '';
+      carregarConta();
     }
   }
 
@@ -2957,7 +2966,29 @@ ${advLinha || '[Advogado(a) — OAB]'}`;
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }
 
+  // ---- Barra de conta (login/uso) ----
+  async function carregarConta() {
+    try {
+      const r = await fetch('/api/me');
+      if (!r.ok) return; // sem backend ou não logado: deixa a barra escondida
+      const u = await r.json();
+      const bar = document.getElementById('contaBar');
+      bar.style.display = 'flex';
+      document.getElementById('contaNome').textContent = (u.nome || u.email || '') + (u.status === 'ativo' ? '' : ' · ' + u.status);
+      atualizarUsoConta(u.restantes, u.limite);
+      if (u.is_admin) document.getElementById('contaAdmin').style.display = 'inline';
+    } catch (e) { /* sem backend: ignora */ }
+  }
+
+  function atualizarUsoConta(restantes, limite) {
+    const el = document.getElementById('contaUso');
+    if (el && typeof restantes === 'number') {
+      el.textContent = `${restantes} de ${limite ?? ''} consultas restantes este mês`;
+    }
+  }
+
   // Inicialização
+  carregarConta();
   renderDespesas();
   document.querySelectorAll('input.money').forEach(aplicarMascara);
   document.getElementById('dependentesIR').addEventListener('change', atualizarCascata);

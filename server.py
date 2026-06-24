@@ -1,145 +1,218 @@
 """
-Backend de leitura inteligente de documentos para a Calculadora de Superendividamento.
+Backend da Calculadora de Superendividamento — versão SaaS.
 
-- Serve a calculadora (index.html) e seus arquivos estáticos.
-- Expõe dois endpoints que usam a IA de visão da Claude para ler documentos
-  (holerite/contracheque e contratos de dívida) e devolver os campos já
-  estruturados, prontos para preencher a calculadora.
+Recursos:
+- Leitura inteligente de documentos (holerite e contratos) via IA de visão da Claude.
+- Contas de assinantes (advogados): cadastro, login, logout.
+- Controle de assinatura (trial / ativo / inativo) e contador de consultas por mês.
+- Base para integração de pagamento (Asaas) via webhook.
 
-A chave de API fica somente aqui no servidor (variável de ambiente
-ANTHROPIC_API_KEY) e nunca é exposta ao navegador.
+A chave de API da Anthropic fica só no servidor (ANTHROPIC_API_KEY) e nunca vai ao navegador.
 
-Como rodar:
-    pip install -r requirements.txt
-    export ANTHROPIC_API_KEY="sua-chave-aqui"   # no Windows: set ANTHROPIC_API_KEY=...
-    python server.py
-    # abra http://localhost:5000
+Variáveis de ambiente:
+- ANTHROPIC_API_KEY : chave da API da Anthropic (obrigatória para a IA).
+- SECRET_KEY        : segredo das sessões de login (defina em produção).
+- DATABASE_URL      : banco PostgreSQL (Railway injeta). Sem ela, usa SQLite local.
+- ADMIN_EMAIL       : e-mail que vira administrador automaticamente.
+- ASAAS_WEBHOOK_TOKEN : token simples para validar o webhook do Asaas (opcional).
 """
 
 import base64
 import io
 import json
 import os
+from datetime import datetime
+from functools import wraps
 
-from flask import Flask, request, jsonify, send_from_directory
+from flask import (
+    Flask, request, jsonify, send_from_directory, redirect, url_for, Response
+)
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import (
+    LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+)
+from werkzeug.security import generate_password_hash, check_password_hash
 import anthropic
 
+# ============================================================
+# Configuração
+# ============================================================
 MODEL = "claude-opus-4-8"
 MAX_TOKENS = 4096
-
-# A API aceita no máximo 100 páginas por PDF. Contratos escaneados costumam ter
-# o resumo financeiro (valor, parcelas, taxa, CET) nas primeiras páginas, então
-# enviamos só as primeiras MAX_PDF_PAGES — economiza custo e evita o limite.
 MAX_PDF_PAGES = 12
 
+LIMITE_POR_STATUS = {"ativo": 50, "trial": 3, "inativo": 0}
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _carregar_env():
+    caminho = os.path.join(BASE_DIR, ".env")
+    if not os.path.exists(caminho):
+        return
+    with open(caminho, "r", encoding="utf-8") as f:
+        for linha in f:
+            linha = linha.strip()
+            if not linha or linha.startswith("#") or "=" not in linha:
+                continue
+            chave, _, valor = linha.partition("=")
+            os.environ.setdefault(chave.strip(), valor.strip().strip('"').strip("'"))
+
+
+_carregar_env()
+
+ADMIN_EMAIL = (os.environ.get("ADMIN_EMAIL") or "fellipe.carolino18@gmail.com").lower()
+
 app = Flask(__name__, static_folder=None)
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "troque-este-segredo-em-producao")
+
+db_url = os.environ.get("DATABASE_URL", "sqlite:///" + os.path.join(BASE_DIR, "calculadora.db"))
+if db_url.startswith("postgres://"):
+    db_url = db_url.replace("postgres://", "postgresql://", 1)
+app.config["SQLALCHEMY_DATABASE_URI"] = db_url
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+db = SQLAlchemy(app)
+login_manager = LoginManager(app)
+login_manager.login_view = "pagina_login"
+
 client = anthropic.Anthropic()  # lê ANTHROPIC_API_KEY do ambiente
 
-# Tipos de dívida aceitos pela calculadora (mantém em sincronia com TIPOS_DIVIDA no index.html)
+
+# ============================================================
+# Modelo de dados
+# ============================================================
+class User(UserMixin, db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(255), unique=True, nullable=False, index=True)
+    senha_hash = db.Column(db.String(255), nullable=False)
+    nome = db.Column(db.String(255))
+    escritorio = db.Column(db.String(255))
+    oab = db.Column(db.String(60))
+    status = db.Column(db.String(20), default="trial")  # trial | ativo | inativo
+    is_admin = db.Column(db.Boolean, default=False)
+    usage_mes = db.Column(db.String(7))   # "AAAA-MM"
+    usage_contagem = db.Column(db.Integer, default=0)
+    asaas_customer_id = db.Column(db.String(120))
+    criado_em = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def set_senha(self, senha):
+        self.senha_hash = generate_password_hash(senha, method="pbkdf2:sha256")
+
+    def conferir_senha(self, senha):
+        return check_password_hash(self.senha_hash, senha)
+
+    @property
+    def limite_mensal(self):
+        return LIMITE_POR_STATUS.get(self.status, 0)
+
+    def _mes_atual(self):
+        return datetime.utcnow().strftime("%Y-%m")
+
+    def consultas_restantes(self):
+        if self.usage_mes != self._mes_atual():
+            return self.limite_mensal
+        return max(self.limite_mensal - (self.usage_contagem or 0), 0)
+
+    def pode_consultar(self):
+        return self.status in ("trial", "ativo") and self.consultas_restantes() > 0
+
+    def registrar_consulta(self):
+        mes = self._mes_atual()
+        if self.usage_mes != mes:
+            self.usage_mes = mes
+            self.usage_contagem = 0
+        self.usage_contagem = (self.usage_contagem or 0) + 1
+        db.session.commit()
+
+
+@login_manager.user_loader
+def load_user(user_id):
+    return db.session.get(User, int(user_id))
+
+
+with app.app_context():
+    db.create_all()
+
+
+# ============================================================
+# Extração por IA (holerite / contrato)
+# ============================================================
 TIPOS_DIVIDA = [
     "cartao", "cheque", "emprestimo", "consignado",
     "financiamento_imovel", "financiamento_veiculo", "aluguel", "alimentos",
     "condominio", "fiscal", "energia", "saude", "educacao", "outro",
 ]
 
-# ----------------------------------------------------------------------------
-# Esquemas de saída estruturada (JSON Schema)
-# ----------------------------------------------------------------------------
 SCHEMA_HOLERITE = {
-    "type": "object",
-    "additionalProperties": False,
+    "type": "object", "additionalProperties": False,
     "properties": {
-        "nome": {"type": ["string", "null"], "description": "Nome do servidor/empregado"},
-        "renda_bruta": {"type": ["number", "null"], "description": "Total de proventos/vencimentos brutos, em reais"},
-        "inss": {"type": ["number", "null"], "description": "Desconto de INSS/PSS/previdência, em reais"},
-        "irrf": {"type": ["number", "null"], "description": "Imposto de renda retido na fonte, em reais"},
-        "pensao": {"type": ["number", "null"], "description": "Pensão alimentícia descontada em folha, em reais"},
-        "outros_descontos": {"type": ["number", "null"], "description": "Soma dos demais descontos obrigatórios (exceto INSS, IRRF, pensão e consignados), em reais"},
-        "consignados_total": {"type": ["number", "null"], "description": "Soma de todas as parcelas de empréstimos/cartões consignados descontadas em folha, em reais"},
+        "nome": {"type": ["string", "null"]},
+        "renda_bruta": {"type": ["number", "null"]},
+        "inss": {"type": ["number", "null"]},
+        "irrf": {"type": ["number", "null"]},
+        "pensao": {"type": ["number", "null"]},
+        "outros_descontos": {"type": ["number", "null"]},
+        "consignados_total": {"type": ["number", "null"]},
         "consignados": {
             "type": "array",
-            "description": "Lista de cada empréstimo/cartão consignado identificado na folha",
             "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "credor": {"type": ["string", "null"]},
-                    "parcela": {"type": ["number", "null"], "description": "Valor da parcela mensal em reais"},
-                },
+                "type": "object", "additionalProperties": False,
+                "properties": {"credor": {"type": ["string", "null"]}, "parcela": {"type": ["number", "null"]}},
                 "required": ["credor", "parcela"],
             },
         },
-        "observacoes": {"type": ["string", "null"], "description": "Observações relevantes (ex.: rubricas que não foi possível classificar)"},
+        "observacoes": {"type": ["string", "null"]},
     },
-    "required": [
-        "nome", "renda_bruta", "inss", "irrf", "pensao",
-        "outros_descontos", "consignados_total", "consignados", "observacoes",
-    ],
+    "required": ["nome", "renda_bruta", "inss", "irrf", "pensao",
+                 "outros_descontos", "consignados_total", "consignados", "observacoes"],
 }
 
 SCHEMA_CONTRATO = {
-    "type": "object",
-    "additionalProperties": False,
+    "type": "object", "additionalProperties": False,
     "properties": {
-        "credor": {"type": ["string", "null"], "description": "Nome do credor/instituição financeira"},
-        "tipo": {"type": "string", "enum": TIPOS_DIVIDA, "description": "Tipo da dívida que melhor descreve o contrato"},
-        "saldo_devedor": {"type": ["number", "null"], "description": "Saldo devedor atual/total em aberto, em reais"},
-        "parcela_mensal": {"type": ["number", "null"], "description": "Valor da parcela mensal, em reais"},
-        "parcelas_contratadas": {"type": ["integer", "null"], "description": "Número total de parcelas contratadas"},
-        "parcelas_pagas": {"type": ["integer", "null"], "description": "Número de parcelas já pagas/quitadas"},
-        "em_folha": {"type": ["boolean", "null"], "description": "true se for desconto consignado em folha de pagamento"},
-        "taxa_juros": {"type": ["string", "null"], "description": "Taxa de juros do contrato, se informada (ex.: '2,5% a.m.')"},
-        "observacoes": {"type": ["string", "null"], "description": "Cláusulas relevantes (juros abusivos, seguros embutidos, tarifas, garantias)"},
+        "credor": {"type": ["string", "null"]},
+        "tipo": {"type": "string", "enum": TIPOS_DIVIDA},
+        "saldo_devedor": {"type": ["number", "null"]},
+        "parcela_mensal": {"type": ["number", "null"]},
+        "parcelas_contratadas": {"type": ["integer", "null"]},
+        "parcelas_pagas": {"type": ["integer", "null"]},
+        "em_folha": {"type": ["boolean", "null"]},
+        "taxa_juros": {"type": ["string", "null"]},
+        "observacoes": {"type": ["string", "null"]},
     },
-    "required": [
-        "credor", "tipo", "saldo_devedor", "parcela_mensal",
-        "parcelas_contratadas", "parcelas_pagas", "em_folha", "taxa_juros", "observacoes",
-    ],
+    "required": ["credor", "tipo", "saldo_devedor", "parcela_mensal",
+                 "parcelas_contratadas", "parcelas_pagas", "em_folha", "taxa_juros", "observacoes"],
 }
 
 PROMPT_HOLERITE = (
-    "Você é um analista jurídico-financeiro especializado em folhas de pagamento brasileiras "
-    "(contracheques de servidores públicos — SIAPE/estaduais/municipais — e da iniciativa privada). "
-    "Leia o documento anexado e extraia os dados para análise de superendividamento.\n\n"
-    "Regras:\n"
-    "- Separe PROVENTOS (vencimentos, gratificações, auxílios, adicionais) dos DESCONTOS.\n"
-    "- 'renda_bruta' = soma de todos os proventos brutos.\n"
-    "- 'inss' = contribuição previdenciária (INSS, PSS, RPPS).\n"
-    "- 'outros_descontos' = descontos obrigatórios que NÃO sejam INSS, IRRF, pensão alimentícia ou consignados.\n"
-    "- 'consignados' = empréstimos e cartões consignados descontados em folha; liste cada um com credor e parcela.\n"
-    "- Valores monetários SEMPRE em reais como número decimal (ex.: 5800.50), sem 'R$' nem separador de milhar.\n"
-    "- Se um campo não existir no documento, retorne null.\n"
-    "- Não invente valores: extraia apenas o que está no documento."
+    "Você é um analista jurídico-financeiro especializado em folhas de pagamento brasileiras. "
+    "Leia o documento e extraia os dados para análise de superendividamento. "
+    "Separe proventos de descontos. 'renda_bruta' = soma dos proventos brutos. "
+    "'inss' = INSS/PSS/previdência. 'outros_descontos' = descontos obrigatórios que não sejam INSS, IRRF, pensão ou consignados. "
+    "'consignados' = empréstimos/cartões consignados em folha (liste credor e parcela). "
+    "Valores em reais como número decimal (ex.: 5800.50), sem 'R$' nem separador de milhar. "
+    "Se um campo não existir, retorne null. Não invente valores."
 )
 
 PROMPT_CONTRATO = (
-    "Você é um analista jurídico-financeiro especializado em contratos de crédito brasileiros "
-    "(empréstimo pessoal, consignado, financiamento de veículo/imóvel, cartão de crédito, cédula de crédito bancário). "
-    "Leia o contrato anexado e extraia os dados da dívida para análise de superendividamento.\n\n"
-    "Regras:\n"
-    "- 'tipo' deve ser o valor da lista que melhor descreve o contrato.\n"
-    "- 'saldo_devedor' = total em aberto / saldo devedor atual, em reais.\n"
-    "- 'parcela_mensal' = valor da prestação mensal, em reais.\n"
-    "- 'parcelas_contratadas' e 'parcelas_pagas' = números inteiros, se informados.\n"
-    "- 'em_folha' = true se for consignado descontado em folha.\n"
-    "- Valores monetários em reais como número decimal (ex.: 28000.00), sem 'R$' nem separador de milhar.\n"
-    "- Em 'observacoes', registre indícios de abusividade (juros muito acima do mercado, venda casada de seguro, tarifas não pactuadas).\n"
-    "- Se um campo não existir, retorne null. Não invente dados."
+    "Você é um analista jurídico-financeiro especializado em contratos de crédito brasileiros. "
+    "Leia o contrato e extraia os dados da dívida. 'tipo' = o valor da lista que melhor descreve. "
+    "'saldo_devedor' = total em aberto. 'parcela_mensal' = prestação mensal. "
+    "'em_folha' = true se consignado. Valores em reais como número decimal, sem 'R$' nem separador de milhar. "
+    "Em 'observacoes', registre indícios de abusividade (juros acima do mercado, venda casada de seguro, "
+    "tarifas não pactuadas, anatocismo, reendividamento). Se um campo não existir, retorne null. Não invente."
 )
 
 
 def _limitar_paginas_pdf(raw):
-    """Se o PDF tiver muitas páginas, devolve só as primeiras MAX_PDF_PAGES.
-    Mantém o arquivo dentro do limite da API e reduz o custo por documento."""
     try:
         from pypdf import PdfReader, PdfWriter
     except ImportError:
-        return raw  # sem pypdf, envia como veio (pode falhar se > 100 páginas)
+        return raw
     try:
         reader = PdfReader(io.BytesIO(raw))
-        n = len(reader.pages)
-        if n <= MAX_PDF_PAGES:
+        if len(reader.pages) <= MAX_PDF_PAGES:
             return raw
         writer = PdfWriter()
         for i in range(MAX_PDF_PAGES):
@@ -152,24 +225,16 @@ def _limitar_paginas_pdf(raw):
 
 
 def _content_block_for_upload(file_storage):
-    """Monta o bloco de conteúdo (documento PDF ou imagem) para a API a partir do upload."""
     raw = file_storage.read()
     if not raw:
         raise ValueError("Arquivo vazio.")
     filename = (file_storage.filename or "").lower()
     mimetype = (file_storage.mimetype or "").lower()
-    data = base64.standard_b64encode(raw).decode("utf-8")
-
-    is_pdf = filename.endswith(".pdf") or "pdf" in mimetype
-    if is_pdf:
+    if filename.endswith(".pdf") or "pdf" in mimetype:
         raw = _limitar_paginas_pdf(raw)
         data = base64.standard_b64encode(raw).decode("utf-8")
-        return {
-            "type": "document",
-            "source": {"type": "base64", "media_type": "application/pdf", "data": data},
-        }
-
-    # Imagem
+        return {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": data}}
+    data = base64.standard_b64encode(raw).decode("utf-8")
     if filename.endswith(".png") or "png" in mimetype:
         media = "image/png"
     elif filename.endswith(".webp") or "webp" in mimetype:
@@ -178,18 +243,13 @@ def _content_block_for_upload(file_storage):
         media = "image/gif"
     else:
         media = "image/jpeg"
-    return {
-        "type": "image",
-        "source": {"type": "base64", "media_type": media, "data": data},
-    }
+    return {"type": "image", "source": {"type": "base64", "media_type": media, "data": data}}
 
 
 def _extrair(prompt, schema, file_storage):
-    """Envia o documento à Claude e devolve o JSON estruturado."""
     bloco = _content_block_for_upload(file_storage)
     response = client.messages.create(
-        model=MODEL,
-        max_tokens=MAX_TOKENS,
+        model=MODEL, max_tokens=MAX_TOKENS,
         messages=[{"role": "user", "content": [bloco, {"type": "text", "text": prompt}]}],
         output_config={"format": {"type": "json_schema", "schema": schema}},
     )
@@ -199,32 +259,175 @@ def _extrair(prompt, schema, file_storage):
     return json.loads(texto)
 
 
-# ----------------------------------------------------------------------------
-# Rotas
-# ----------------------------------------------------------------------------
+def _checar_uso():
+    """Retorna (ok, mensagem_erro_ou_None) para uso da IA pelo usuário atual."""
+    if current_user.status == "inativo":
+        return False, "Sua assinatura está inativa. Regularize o pagamento para usar a leitura por IA."
+    if current_user.consultas_restantes() <= 0:
+        return False, f"Você atingiu o limite de {current_user.limite_mensal} consultas neste mês."
+    return True, None
+
+
+# ============================================================
+# Páginas (HTML simples, embutido)
+# ============================================================
+def _pagina_auth(titulo, corpo):
+    return Response(PAGINA_BASE.replace("{{TITULO}}", titulo).replace("{{CORPO}}", corpo), mimetype="text/html")
+
+
+PAGINA_BASE = """<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{{TITULO}} · Calculadora de Superendividamento</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;font-family:'Segoe UI',system-ui,sans-serif}
+body{background:linear-gradient(135deg,#1a3a5c,#2c5f8a);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;color:#1c2b3a}
+.card{background:#fff;border-radius:14px;box-shadow:0 12px 48px rgba(0,0,0,.25);width:100%;max-width:420px;overflow:hidden}
+.top{background:#1a3a5c;color:#fff;padding:24px 28px;text-align:center}
+.top .logo{font-size:32px}
+.top h1{font-size:1.2rem;margin-top:6px}
+.top p{font-size:.8rem;opacity:.8;margin-top:2px}
+.body{padding:28px}
+.body h2{font-size:1.1rem;color:#1a3a5c;margin-bottom:4px}
+.body .sub{font-size:.85rem;color:#5a6a7a;margin-bottom:18px}
+label{display:block;font-size:.8rem;font-weight:600;color:#5a6a7a;margin:12px 0 5px;text-transform:uppercase;letter-spacing:.4px}
+input{width:100%;padding:11px 14px;border:1.5px solid #d0d7e2;border-radius:8px;font-size:.95rem;background:#fafbfd;outline:none}
+input:focus{border-color:#2c5f8a;background:#fff}
+.btn{width:100%;padding:13px;border:none;border-radius:8px;background:#c8960c;color:#fff;font-size:1rem;font-weight:700;cursor:pointer;margin-top:20px}
+.btn:hover{background:#f0b429}
+.link{text-align:center;margin-top:16px;font-size:.88rem;color:#5a6a7a}
+.link a{color:#2c5f8a;font-weight:600;text-decoration:none}
+.erro{background:#fdecea;color:#7a2218;border:1px solid #e8a49a;border-radius:8px;padding:10px 14px;font-size:.85rem;margin-bottom:14px}
+.ok{background:#e9f7ee;color:#1b5e20;border:1px solid #7ec891;border-radius:8px;padding:10px 14px;font-size:.85rem;margin-bottom:14px}
+</style></head><body><div class="card">
+<div class="top"><div class="logo">⚖️</div><h1>Calculadora de Superendividamento</h1><p>Lei 14.181/2021 · para advogados</p></div>
+<div class="body">{{CORPO}}</div></div></body></html>"""
+
+
+def login_required_page(f):
+    """Como login_required, mas redireciona páginas (não-API) para /login."""
+    @wraps(f)
+    @login_required
+    def wrap(*a, **k):
+        return f(*a, **k)
+    return wrap
+
+
+# ============================================================
+# Rotas — Autenticação
+# ============================================================
+@app.route("/login", methods=["GET", "POST"])
+def pagina_login():
+    if current_user.is_authenticated:
+        return redirect(url_for("index"))
+    erro = ""
+    if request.method == "POST":
+        email = (request.form.get("email") or "").strip().lower()
+        senha = request.form.get("senha") or ""
+        user = User.query.filter_by(email=email).first()
+        if user and user.conferir_senha(senha):
+            login_user(user, remember=True)
+            return redirect(url_for("index"))
+        erro = '<div class="erro">E-mail ou senha incorretos.</div>'
+    corpo = f"""<h2>Entrar</h2><div class="sub">Acesse sua conta para usar a calculadora.</div>{erro}
+    <form method="post">
+      <label>E-mail</label><input type="email" name="email" required placeholder="voce@escritorio.adv.br">
+      <label>Senha</label><input type="password" name="senha" required placeholder="••••••••">
+      <button class="btn" type="submit">Entrar</button>
+    </form>
+    <div class="link">Ainda não tem conta? <a href="/signup">Criar conta</a></div>"""
+    return _pagina_auth("Entrar", corpo)
+
+
+@app.route("/signup", methods=["GET", "POST"])
+def pagina_signup():
+    if current_user.is_authenticated:
+        return redirect(url_for("index"))
+    msg = ""
+    if request.method == "POST":
+        nome = (request.form.get("nome") or "").strip()
+        email = (request.form.get("email") or "").strip().lower()
+        senha = request.form.get("senha") or ""
+        escritorio = (request.form.get("escritorio") or "").strip()
+        if not email or len(senha) < 6:
+            msg = '<div class="erro">Informe um e-mail válido e senha de no mínimo 6 caracteres.</div>'
+        elif User.query.filter_by(email=email).first():
+            msg = '<div class="erro">Já existe uma conta com este e-mail.</div>'
+        else:
+            user = User(email=email, nome=nome, escritorio=escritorio, status="trial")
+            user.set_senha(senha)
+            if email == ADMIN_EMAIL:
+                user.is_admin = True
+                user.status = "ativo"
+            db.session.add(user)
+            db.session.commit()
+            login_user(user, remember=True)
+            return redirect(url_for("index"))
+    corpo = f"""<h2>Criar conta</h2><div class="sub">Comece com algumas consultas de teste gratuitas.</div>{msg}
+    <form method="post">
+      <label>Nome</label><input name="nome" placeholder="Seu nome">
+      <label>Escritório (opcional)</label><input name="escritorio" placeholder="Nome do escritório">
+      <label>E-mail</label><input type="email" name="email" required placeholder="voce@escritorio.adv.br">
+      <label>Senha</label><input type="password" name="senha" required placeholder="mínimo 6 caracteres">
+      <button class="btn" type="submit">Criar conta</button>
+    </form>
+    <div class="link">Já tem conta? <a href="/login">Entrar</a></div>"""
+    return _pagina_auth("Criar conta", corpo)
+
+
+@app.route("/logout")
+def pagina_logout():
+    logout_user()
+    return redirect(url_for("pagina_login"))
+
+
+# ============================================================
+# Rotas — Aplicação
+# ============================================================
 @app.route("/")
 def index():
+    if not current_user.is_authenticated:
+        return redirect(url_for("pagina_login"))
     return send_from_directory(BASE_DIR, "index.html")
 
 
+@app.route("/api/me")
+@login_required
+def api_me():
+    return jsonify({
+        "nome": current_user.nome, "email": current_user.email,
+        "status": current_user.status, "is_admin": current_user.is_admin,
+        "limite": current_user.limite_mensal,
+        "restantes": current_user.consultas_restantes(),
+    })
+
+
 @app.route("/api/extract-holerite", methods=["POST"])
+@login_required
 def extract_holerite():
+    ok, erro = _checar_uso()
+    if not ok:
+        return jsonify({"ok": False, "erro": erro, "limite": True}), 402
     if "file" not in request.files:
-        return jsonify({"erro": "Nenhum arquivo enviado."}), 400
+        return jsonify({"ok": False, "erro": "Nenhum arquivo enviado."}), 400
     try:
         dados = _extrair(PROMPT_HOLERITE, SCHEMA_HOLERITE, request.files["file"])
-        return jsonify({"ok": True, "dados": dados})
+        current_user.registrar_consulta()
+        return jsonify({"ok": True, "dados": dados, "restantes": current_user.consultas_restantes()})
     except Exception as e:  # noqa: BLE001
         return jsonify({"ok": False, "erro": str(e)}), 500
 
 
 @app.route("/api/extract-contrato", methods=["POST"])
+@login_required
 def extract_contrato():
+    ok, erro = _checar_uso()
+    if not ok:
+        return jsonify({"ok": False, "erro": erro, "limite": True}), 402
     if "file" not in request.files:
-        return jsonify({"erro": "Nenhum arquivo enviado."}), 400
+        return jsonify({"ok": False, "erro": "Nenhum arquivo enviado."}), 400
     try:
         dados = _extrair(PROMPT_CONTRATO, SCHEMA_CONTRATO, request.files["file"])
-        return jsonify({"ok": True, "dados": dados})
+        current_user.registrar_consulta()
+        return jsonify({"ok": True, "dados": dados, "restantes": current_user.consultas_restantes()})
     except Exception as e:  # noqa: BLE001
         return jsonify({"ok": False, "erro": str(e)}), 500
 
@@ -234,10 +437,80 @@ def health():
     return jsonify({"ok": True, "model": MODEL, "tem_chave": bool(os.environ.get("ANTHROPIC_API_KEY"))})
 
 
+# ============================================================
+# Webhook do Asaas (ativa/desativa assinatura conforme pagamento)
+# ============================================================
+@app.route("/api/asaas-webhook", methods=["POST"])
+def asaas_webhook():
+    token_esperado = os.environ.get("ASAAS_WEBHOOK_TOKEN")
+    if token_esperado and request.headers.get("asaas-access-token") != token_esperado:
+        return jsonify({"ok": False}), 401
+    evento = request.get_json(silent=True) or {}
+    tipo = evento.get("event", "")
+    pagamento = evento.get("payment", {}) or {}
+    email = (pagamento.get("customerEmail") or "").lower()
+    # Fallback: alguns eventos trazem só o customer id
+    user = None
+    if email:
+        user = User.query.filter_by(email=email).first()
+    if user:
+        if tipo in ("PAYMENT_CONFIRMED", "PAYMENT_RECEIVED"):
+            user.status = "ativo"
+        elif tipo in ("PAYMENT_OVERDUE", "PAYMENT_DELETED", "PAYMENT_REFUNDED", "SUBSCRIPTION_DELETED"):
+            user.status = "inativo"
+        db.session.commit()
+    return jsonify({"ok": True})
+
+
+# ============================================================
+# Admin (gestão simples de assinantes)
+# ============================================================
+@app.route("/admin")
+@login_required
+def admin():
+    if not current_user.is_admin:
+        return redirect(url_for("index"))
+    users = User.query.order_by(User.criado_em.desc()).all()
+    linhas = ""
+    for u in users:
+        linhas += f"""<tr>
+          <td>{u.nome or '—'}<br><small>{u.email}</small></td>
+          <td>{u.escritorio or '—'}</td>
+          <td><b>{u.status}</b></td>
+          <td>{(u.usage_contagem or 0) if u.usage_mes == datetime.utcnow().strftime('%Y-%m') else 0}/{u.limite_mensal}</td>
+          <td>
+            <a href="/admin/status/{u.id}/ativo">ativar</a> ·
+            <a href="/admin/status/{u.id}/inativo">inativar</a> ·
+            <a href="/admin/status/{u.id}/trial">trial</a>
+          </td></tr>"""
+    html = f"""<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
+    <title>Admin · Assinantes</title><style>
+    body{{font-family:'Segoe UI',sans-serif;background:#f4f6f9;padding:24px;color:#1c2b3a}}
+    h1{{color:#1a3a5c}} table{{width:100%;border-collapse:collapse;background:#fff;margin-top:16px;box-shadow:0 2px 12px rgba(0,0,0,.08);border-radius:8px;overflow:hidden}}
+    th{{background:#1a3a5c;color:#fff;padding:10px;text-align:left;font-size:.8rem}} td{{padding:10px;border-bottom:1px solid #eee;font-size:.9rem}}
+    a{{color:#2c5f8a;text-decoration:none;font-size:.82rem}} small{{color:#888}}
+    .voltar{{display:inline-block;margin-bottom:12px;color:#2c5f8a;text-decoration:none}}</style></head><body>
+    <a class="voltar" href="/">← Voltar à calculadora</a>
+    <h1>Assinantes ({len(users)})</h1>
+    <table><thead><tr><th>Advogado</th><th>Escritório</th><th>Status</th><th>Uso/mês</th><th>Ações</th></tr></thead>
+    <tbody>{linhas}</tbody></table></body></html>"""
+    return Response(html, mimetype="text/html")
+
+
+@app.route("/admin/status/<int:uid>/<novo>")
+@login_required
+def admin_status(uid, novo):
+    if not current_user.is_admin or novo not in ("ativo", "inativo", "trial"):
+        return redirect(url_for("index"))
+    u = db.session.get(User, uid)
+    if u:
+        u.status = novo
+        db.session.commit()
+    return redirect(url_for("admin"))
+
+
 if __name__ == "__main__":
     if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("\n⚠️  ANTHROPIC_API_KEY não definida. A leitura por IA não vai funcionar.")
-        print("    Defina com:  export ANTHROPIC_API_KEY=\"sua-chave\"\n")
-    # PORT é injetada pelo host (Render/Railway); localmente cai em 5000.
+        print("\n⚠️  ANTHROPIC_API_KEY não definida. A leitura por IA não vai funcionar.\n")
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)

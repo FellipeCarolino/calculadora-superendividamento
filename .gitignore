@@ -21,3 +21,7 @@ venv/
 *.jpg
 *.jpeg
 *.png
+
+# Banco local
+calculadora.db
+*.db
