@@ -1888,7 +1888,10 @@
     if (resp.status === 404 || resp.status === 405) {
       const e = new Error('sem-backend'); e.semBackend = true; throw e;
     }
-    const json = await resp.json().catch(() => ({ ok: false, erro: 'Resposta inválida do servidor.' }));
+    if (resp.status === 502 || resp.status === 503 || resp.status === 504) {
+      throw new Error('A leitura demorou mais que o esperado e o servidor encerrou a conexão. Tente novamente — costuma funcionar na segunda tentativa.');
+    }
+    const json = await resp.json().catch(() => ({ ok: false, erro: 'A leitura demorou demais ou o servidor não respondeu. Tente novamente.' }));
     if (!resp.ok || !json.ok) {
       throw new Error(json.erro || ('Erro ' + resp.status));
     }
