@@ -54,6 +54,7 @@ PLANO_DESC = "Assinatura Repactua — plano Profissional (50 consultas/mês)"
 
 # --- Nota fiscal automática (NFS-e via Asaas) ---
 NF_AUTO = os.environ.get("NF_AUTO", "0") == "1"
+NF_SERVICO_ID = os.environ.get("NF_SERVICO_ID", "")           # ID do serviço registrado no Asaas
 NF_SERVICO_CODIGO = os.environ.get("NF_SERVICO_CODIGO", "")   # código do serviço municipal
 NF_SERVICO_NOME = os.environ.get("NF_SERVICO_NOME", "")       # descrição do serviço
 NF_ISS = float(os.environ.get("NF_ISS", "0") or 0)            # alíquota de ISS (%)
@@ -536,7 +537,7 @@ def assinar_post():
             "description": PLANO_DESC,
         })
         # Configura emissão automática de nota fiscal para a assinatura (se ativado)
-        if NF_AUTO and (NF_SERVICO_CODIGO or NF_SERVICO_NOME):
+        if NF_AUTO and (NF_SERVICO_ID or NF_SERVICO_CODIGO or NF_SERVICO_NOME):
             cfg_nf = {
                 "deductions": NF_DEDUCOES,
                 "effectiveDatePeriod": NF_QUANDO,
@@ -545,14 +546,16 @@ def assinar_post():
                 "taxes": {"retainIss": NF_RETER_ISS, "iss": NF_ISS,
                           "cofins": 0, "csll": 0, "inss": 0, "ir": 0, "pis": 0},
             }
+            if NF_SERVICO_ID:
+                cfg_nf["municipalServiceId"] = NF_SERVICO_ID
             if NF_SERVICO_CODIGO:
                 cfg_nf["municipalServiceCode"] = NF_SERVICO_CODIGO
             if NF_SERVICO_NOME:
                 cfg_nf["municipalServiceName"] = NF_SERVICO_NOME
             try:
                 asaas("POST", "/subscriptions/%s/invoiceSettings" % assinatura.get("id"), cfg_nf)
-            except Exception as e_nf:  # DEBUG TEMPORÁRIO: mostrar o erro da NF
-                raise RuntimeError("[NF] " + str(e_nf))
+            except Exception:
+                pass  # não bloquear o pagamento se a configuração de NF falhar
 
         pagamentos = asaas("GET", "/subscriptions/%s/payments" % assinatura.get("id"))
         dados = (pagamentos.get("data") or [])
