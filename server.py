@@ -393,7 +393,7 @@ def pagina_logout():
 @app.route("/")
 def index():
     if not current_user.is_authenticated:
-        return redirect(url_for("pagina_login"))
+        return send_from_directory(BASE_DIR, "landing.html")
     return send_from_directory(BASE_DIR, "index.html")
 
 
