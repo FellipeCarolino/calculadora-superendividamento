@@ -1065,7 +1065,9 @@ def admin():
           <td>
             <a href="/admin/status/{u.id}/ativo">ativar</a> ·
             <a href="/admin/status/{u.id}/inativo">inativar</a> ·
-            <a href="/admin/status/{u.id}/trial">trial</a>
+            <a href="/admin/status/{u.id}/trial">trial</a><br>
+            <a href="/admin/plano/{u.id}/escritorio">→ escritório (cortesia)</a> ·
+            <a href="/admin/plano/{u.id}/individual">→ individual</a>
           </td></tr>"""
     html = f"""<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
     <title>Admin · Assinantes</title><style>
@@ -1091,6 +1093,25 @@ def admin_status(uid, novo):
         u.status = novo            # legado
         if u.org:
             u.org.status = novo    # fonte de verdade
+        db.session.commit()
+    return redirect(url_for("admin"))
+
+
+@app.route("/admin/plano/<int:uid>/<plano>")
+@login_required
+def admin_plano(uid, plano):
+    """Define o plano do escritório do usuário como cortesia (ativa sem cobrança)."""
+    if not current_user.is_admin or plano not in PLANOS:
+        return redirect(url_for("index"))
+    u = db.session.get(User, uid)
+    if u and u.org:
+        u.org.plano = plano
+        u.org.max_membros = PLANOS[plano]["max_membros"]
+        u.org.creditos_total = PLANOS[plano]["pool"]
+        u.org.status = "ativo"     # cortesia: ativa sem pagamento
+        u.status = "ativo"
+        if not u.cota_mensal:
+            u.cota_mensal = 50
         db.session.commit()
     return redirect(url_for("admin"))
 
