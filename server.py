@@ -58,6 +58,7 @@ PLANOS = {
         "nome": "Individual",
         "valor": float(os.environ.get("PLANO_VALOR_IND", "129.90")),
         "max_membros": 1,
+        "pool": 50,
         "desc": "Assinatura Repactua — Individual (1 acesso · 50 consultas/mês)",
         "resumo": "1 acesso · 50 consultas de IA por mês",
     },
@@ -65,8 +66,9 @@ PLANOS = {
         "nome": "Escritório",
         "valor": float(os.environ.get("PLANO_VALOR_ESC", "229.90")),
         "max_membros": 5,
-        "desc": "Assinatura Repactua — Escritório (até 5 acessos · 50 consultas/mês por pessoa)",
-        "resumo": "Até 5 acessos · 50 consultas por pessoa/mês",
+        "pool": 250,
+        "desc": "Assinatura Repactua — Escritório (até 5 acessos · pool de 250 consultas/mês)",
+        "resumo": "Até 5 acessos · pool de 250 consultas/mês (você distribui)",
     },
 }
 
@@ -137,6 +139,7 @@ class Escritorio(db.Model):
     status = db.Column(db.String(20), default="trial")      # trial | ativo | inativo
     asaas_customer_id = db.Column(db.String(120))
     max_membros = db.Column(db.Integer, default=1)
+    creditos_total = db.Column(db.Integer, default=50)  # pool de consultas/mês do escritório
     criado_em = db.Column(db.DateTime, default=datetime.utcnow)
 
     usuarios = db.relationship("User", backref="org", lazy=True,
@@ -149,6 +152,14 @@ class Escritorio(db.Model):
     @property
     def vagas_restantes(self):
         return max((self.max_membros or 1) - self.total_membros, 0)
+
+    @property
+    def cota_distribuida(self):
+        return sum((u.cota_mensal or 0) for u in (self.usuarios or []))
+
+    @property
+    def cota_disponivel(self):
+        return max((self.creditos_total or 0) - self.cota_distribuida, 0)
 
 
 class User(UserMixin, db.Model):
@@ -166,6 +177,7 @@ class User(UserMixin, db.Model):
     criado_em = db.Column(db.DateTime, default=datetime.utcnow)
     org_id = db.Column(db.Integer, db.ForeignKey("escritorio.id"))
     papel = db.Column(db.String(20), default="dono")  # dono | membro
+    cota_mensal = db.Column(db.Integer, default=50)    # créditos atribuídos a este usuário
 
     def set_senha(self, senha):
         self.senha_hash = generate_password_hash(senha, method="pbkdf2:sha256")
@@ -182,7 +194,10 @@ class User(UserMixin, db.Model):
 
     @property
     def limite_mensal(self):
-        return LIMITE_POR_STATUS.get(self.status_efetivo, 0)
+        st = self.status_efetivo
+        if st == "ativo":
+            return self.cota_mensal if self.cota_mensal is not None else 50
+        return LIMITE_POR_STATUS.get(st, 0)  # trial=3, inativo=0
 
     def _mes_atual(self):
         return datetime.utcnow().strftime("%Y-%m")
@@ -216,6 +231,8 @@ def _migrar_schema():
     for ddl in (
         'ALTER TABLE "user" ADD COLUMN org_id INTEGER',
         'ALTER TABLE "user" ADD COLUMN papel VARCHAR(20)',
+        'ALTER TABLE "user" ADD COLUMN cota_mensal INTEGER',
+        'ALTER TABLE escritorio ADD COLUMN creditos_total INTEGER',
     ):
         try:
             db.session.execute(text(ddl))
@@ -232,13 +249,24 @@ def _migrar_schema():
                 status=(u.status or "trial"),
                 asaas_customer_id=u.asaas_customer_id,
                 max_membros=1,
+                creditos_total=50,
             )
             db.session.add(org)
             db.session.flush()
             u.org_id = org.id
             u.papel = "dono"
+            u.cota_mensal = 50
         if orfaos:
             db.session.commit()
+    except Exception:
+        db.session.rollback()
+    # Backfill de cotas/pool faltantes
+    try:
+        for u in User.query.filter(User.cota_mensal.is_(None)).all():
+            u.cota_mensal = 50
+        for o in Escritorio.query.filter(Escritorio.creditos_total.is_(None)).all():
+            o.creditos_total = PLANOS.get(o.plano, PLANOS["individual"])["pool"]
+        db.session.commit()
     except Exception:
         db.session.rollback()
 
@@ -722,6 +750,10 @@ def assinar_post():
         # registra o plano escolhido no escritório
         org.plano = plano
         org.max_membros = PLANOS[plano]["max_membros"]
+        org.creditos_total = PLANOS[plano]["pool"]
+        # cota do dono: Individual = 50; Escritório = começa com 50 (gestor redistribui)
+        if not current_user.cota_mensal:
+            current_user.cota_mensal = 50
         db.session.commit()
         assinatura = asaas("POST", "/subscriptions", {
             "customer": org.asaas_customer_id,
@@ -763,6 +795,224 @@ def assinar_post():
         <div class="erro">{str(e)[:300]}</div>
         <div class="link"><a href="/assinar">← Tentar de novo</a></div>"""
         return _pagina_auth("Erro", corpo)
+
+
+# ============================================================
+# Painel "Minha Conta" + gestão de equipe
+# ============================================================
+PAGINA_CONTA = """<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Minha Conta · Repactua</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 80 80'%3E%3Crect width='80' height='80' rx='18' fill='%231a3a5c'/%3E%3Cpolyline points='26,22 38,40 26,58' fill='none' stroke='%23c8960c' stroke-width='6' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpolyline points='54,22 42,40 54,58' fill='none' stroke='%23c8960c' stroke-width='6' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='40' cy='40' r='3.5' fill='%23c8960c'/%3E%3C/svg%3E">
+<style>
+*{box-sizing:border-box;margin:0;padding:0;font-family:'Segoe UI',system-ui,sans-serif}
+body{background:#f4f6f9;min-height:100vh;color:#1c2b3a;padding:24px}
+.wrap{max-width:760px;margin:0 auto}
+.topo{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
+.topo h1{color:#1a3a5c;font-size:1.4rem;display:flex;align-items:center;gap:10px}
+.topo a{color:#2c5f8a;text-decoration:none;font-size:.9rem;font-weight:600}
+.card{background:#fff;border-radius:12px;box-shadow:0 2px 14px rgba(0,0,0,.07);padding:22px;margin-bottom:18px}
+.card h2{font-size:1.05rem;color:#1a3a5c;margin-bottom:14px;border-bottom:1px solid #eef1f5;padding-bottom:10px}
+.row{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:8px 0;font-size:.92rem}
+.badge{padding:3px 12px;border-radius:20px;font-size:.78rem;font-weight:700}
+.b-ativo{background:#e9f7ee;color:#1b5e20}.b-trial{background:#fff4e0;color:#9a6700}.b-inativo{background:#fdecea;color:#7a2218}
+.bar{height:12px;background:#eef1f5;border-radius:8px;overflow:hidden;margin-top:6px}
+.bar > i{display:block;height:100%;background:#c8960c;border-radius:8px}
+.muted{color:#5a6a7a;font-size:.82rem}
+table{width:100%;border-collapse:collapse;margin-top:8px}
+th{text-align:left;font-size:.72rem;text-transform:uppercase;color:#5a6a7a;padding:8px;border-bottom:1px solid #eef1f5}
+td{padding:8px;border-bottom:1px solid #f3f5f8;font-size:.88rem;vertical-align:middle}
+input,button{font-family:inherit}
+input[type=text],input[type=email],input[type=password],input[type=number]{padding:9px 11px;border:1.5px solid #d0d7e2;border-radius:7px;font-size:.9rem;background:#fafbfd;width:100%}
+.btn{padding:9px 16px;border:none;border-radius:7px;background:#c8960c;color:#fff;font-weight:700;cursor:pointer;font-size:.88rem}
+.btn:hover{background:#f0b429}
+.btn-sm{padding:5px 10px;font-size:.78rem;border-radius:6px;border:none;cursor:pointer}
+.btn-rem{background:#fdecea;color:#a3271a}.btn-cota{background:#eef4fb;color:#2c5f8a}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.grid label{font-size:.74rem;text-transform:uppercase;color:#5a6a7a;font-weight:600;display:block;margin-bottom:4px}
+.ok{background:#e9f7ee;color:#1b5e20;border:1px solid #7ec891;border-radius:8px;padding:10px 14px;font-size:.85rem;margin-bottom:14px}
+.erro{background:#fdecea;color:#7a2218;border:1px solid #e8a49a;border-radius:8px;padding:10px 14px;font-size:.85rem;margin-bottom:14px}
+.pool{background:#fffaf0;border:1px solid #f0d9a0;border-radius:8px;padding:12px;margin-bottom:12px;font-size:.9rem}
+</style></head><body><div class="wrap">{{CORPO}}</div></body></html>"""
+
+
+def _badge(status):
+    cls = {"ativo": "b-ativo", "trial": "b-trial", "inativo": "b-inativo"}.get(status, "b-trial")
+    return f'<span class="badge {cls}">{status.upper()}</span>'
+
+
+def render_conta(msg_ok="", msg_erro=""):
+    u = current_user
+    org = u.org
+    plano = org.plano if org else "individual"
+    plano_nome = PLANOS.get(plano, {}).get("nome", "Individual")
+    usados = (u.usage_contagem or 0) if u.usage_mes == datetime.utcnow().strftime("%Y-%m") else 0
+    cota = u.cota_mensal or 0
+    pct = int(usados * 100 / cota) if cota else 0
+    avisos = (f'<div class="ok">{msg_ok}</div>' if msg_ok else "") + \
+             (f'<div class="erro">{msg_erro}</div>' if msg_erro else "")
+
+    bloco_plano = f"""<div class="card">
+      <h2>Plano</h2>
+      <div class="row"><span>Plano atual</span><b>{plano_nome}</b></div>
+      <div class="row"><span>Situação</span>{_badge(u.status_efetivo)}</div>
+      <div class="row"><span>Suas consultas este mês</span><b>{usados} / {cota}</b></div>
+      <div class="bar"><i style="width:{min(pct,100)}%"></i></div>
+      <div class="muted" style="margin-top:8px">As consultas renovam todo mês.{' ' if u.status_efetivo=='ativo' else ' Assine para liberar 50/mês.'}</div>
+      {'' if u.status_efetivo=='ativo' else '<div class="row" style="margin-top:10px"><a class="btn" href="/assinar" style="text-decoration:none">Assinar agora →</a></div>'}
+    </div>"""
+
+    bloco_equipe = ""
+    if u.papel == "dono" and plano == "escritorio" and org:
+        linhas = ""
+        for m in sorted(org.usuarios, key=lambda x: (x.papel != "dono", x.nome or x.email)):
+            m_usados = (m.usage_contagem or 0) if m.usage_mes == datetime.utcnow().strftime("%Y-%m") else 0
+            eh_dono = m.papel == "dono"
+            acoes = ""
+            if not eh_dono:
+                acoes = f"""<form method="post" action="/conta/membro/{m.id}/remover" style="display:inline" onsubmit="return confirm('Remover {m.email}?')"><button class="btn-sm btn-rem">remover</button></form>"""
+            linhas += f"""<tr>
+              <td>{m.nome or '—'}<br><small class="muted">{m.email}</small></td>
+              <td>{'dono' if eh_dono else 'membro'}</td>
+              <td>
+                <form method="post" action="/conta/membro/{m.id}/cota" style="display:flex;gap:6px;align-items:center">
+                  <input type="number" name="cota" value="{m.cota_mensal or 0}" min="0" style="width:74px" min="0">
+                  <button class="btn-sm btn-cota">salvar</button>
+                </form>
+              </td>
+              <td>{m_usados}</td>
+              <td>{acoes}</td>
+            </tr>"""
+        form_add = ""
+        if org.vagas_restantes > 0:
+            form_add = f"""<h2 style="margin-top:20px">Adicionar membro</h2>
+            <form method="post" action="/conta/membro">
+              <div class="grid">
+                <div><label>Nome</label><input type="text" name="nome" placeholder="Nome do membro"></div>
+                <div><label>E-mail (login)</label><input type="email" name="email" required placeholder="colega@escritorio.adv.br"></div>
+                <div><label>Senha inicial</label><input type="text" name="senha" required placeholder="mínimo 6 caracteres"></div>
+                <div><label>Cota de consultas/mês</label><input type="number" name="cota" value="0" min="0" max="{org.cota_disponivel}"></div>
+              </div>
+              <div style="margin-top:12px"><button class="btn">Criar membro</button></div>
+            </form>"""
+        else:
+            form_add = '<div class="muted" style="margin-top:14px">Limite de 5 acessos atingido. Remova um membro para adicionar outro.</div>'
+        bloco_equipe = f"""<div class="card">
+          <h2>Equipe do escritório</h2>
+          <div class="pool">
+            <b>Pool de créditos:</b> {org.cota_distribuida} de {org.creditos_total} distribuídos ·
+            <b>{org.cota_disponivel}</b> disponíveis para distribuir ·
+            {org.total_membros}/{org.max_membros} acessos
+          </div>
+          <table>
+            <thead><tr><th>Membro</th><th>Papel</th><th>Cota/mês</th><th>Usou</th><th></th></tr></thead>
+            <tbody>{linhas}</tbody>
+          </table>
+          {form_add}
+        </div>"""
+
+    bloco_senha = """<div class="card">
+      <h2>Segurança</h2>
+      <form method="post" action="/conta/senha" class="grid">
+        <div><label>Nova senha</label><input type="password" name="senha" required placeholder="mínimo 6 caracteres"></div>
+        <div style="display:flex;align-items:flex-end"><button class="btn">Trocar senha</button></div>
+      </form>
+    </div>"""
+
+    corpo = f"""<div class="topo">
+      <h1>👤 Minha Conta</h1>
+      <div><a href="/">← Calculadora</a>{' · <a href="/admin">Admin</a>' if u.is_admin else ''} · <a href="/logout">Sair</a></div>
+    </div>
+    {avisos}{bloco_plano}{bloco_equipe}{bloco_senha}"""
+    return Response(PAGINA_CONTA.replace("{{CORPO}}", corpo), mimetype="text/html")
+
+
+@app.route("/conta")
+@login_required
+def conta():
+    return render_conta()
+
+
+@app.route("/conta/senha", methods=["POST"])
+@login_required
+def conta_senha():
+    senha = request.form.get("senha") or ""
+    if len(senha) < 6:
+        return render_conta(msg_erro="A senha deve ter no mínimo 6 caracteres.")
+    current_user.set_senha(senha)
+    db.session.commit()
+    return render_conta(msg_ok="Senha alterada com sucesso.")
+
+
+def _exige_dono_escritorio():
+    org = current_user.org
+    if current_user.papel != "dono" or not org or org.plano != "escritorio":
+        return None
+    return org
+
+
+@app.route("/conta/membro", methods=["POST"])
+@login_required
+def conta_membro_add():
+    org = _exige_dono_escritorio()
+    if not org:
+        return render_conta(msg_erro="Apenas o dono de um plano Escritório pode adicionar membros.")
+    nome = (request.form.get("nome") or "").strip()
+    email = (request.form.get("email") or "").strip().lower()
+    senha = request.form.get("senha") or ""
+    try:
+        cota = max(int(request.form.get("cota") or 0), 0)
+    except ValueError:
+        cota = 0
+    if org.vagas_restantes <= 0:
+        return render_conta(msg_erro="Limite de 5 acessos atingido.")
+    if not email or len(senha) < 6:
+        return render_conta(msg_erro="Informe e-mail válido e senha de no mínimo 6 caracteres.")
+    if User.query.filter_by(email=email).first():
+        return render_conta(msg_erro="Já existe uma conta com este e-mail.")
+    if cota > org.cota_disponivel:
+        return render_conta(msg_erro=f"Cota indisponível. Restam {org.cota_disponivel} créditos para distribuir.")
+    m = User(email=email, nome=nome, escritorio=org.nome, org_id=org.id,
+             papel="membro", cota_mensal=cota, status=org.status)
+    m.set_senha(senha)
+    db.session.add(m)
+    db.session.commit()
+    return render_conta(msg_ok=f"Membro {email} criado com cota de {cota} consultas/mês.")
+
+
+@app.route("/conta/membro/<int:mid>/cota", methods=["POST"])
+@login_required
+def conta_membro_cota(mid):
+    org = _exige_dono_escritorio()
+    if not org:
+        return render_conta(msg_erro="Ação não permitida.")
+    m = db.session.get(User, mid)
+    if not m or m.org_id != org.id:
+        return render_conta(msg_erro="Membro não encontrado.")
+    try:
+        nova = max(int(request.form.get("cota") or 0), 0)
+    except ValueError:
+        return render_conta(msg_erro="Cota inválida.")
+    # disponível considerando a cota atual deste membro
+    disponivel_para_ele = org.cota_disponivel + (m.cota_mensal or 0)
+    if nova > disponivel_para_ele:
+        return render_conta(msg_erro=f"Cota acima do pool. Máximo para este membro: {disponivel_para_ele}.")
+    m.cota_mensal = nova
+    db.session.commit()
+    return render_conta(msg_ok=f"Cota de {m.email} ajustada para {nova}.")
+
+
+@app.route("/conta/membro/<int:mid>/remover", methods=["POST"])
+@login_required
+def conta_membro_remover(mid):
+    org = _exige_dono_escritorio()
+    if not org:
+        return render_conta(msg_erro="Ação não permitida.")
+    m = db.session.get(User, mid)
+    if not m or m.org_id != org.id or m.papel == "dono":
+        return render_conta(msg_erro="Não é possível remover este usuário.")
+    db.session.delete(m)
+    db.session.commit()
+    return render_conta(msg_ok="Membro removido.")
 
 
 # ============================================================
