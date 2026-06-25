@@ -751,8 +751,11 @@ def assinar_post():
         org.plano = plano
         org.max_membros = PLANOS[plano]["max_membros"]
         org.creditos_total = PLANOS[plano]["pool"]
-        # cota do dono: Individual = 50; Escritório = começa com 50 (gestor redistribui)
-        if not current_user.cota_mensal:
+        # cota do dono: Individual = 50; Escritório = pool inteiro (gestor redistribui aos membros)
+        if plano == "escritorio":
+            outros = sum((m.cota_mensal or 0) for m in org.usuarios if m.id != current_user.id)
+            current_user.cota_mensal = max(PLANOS[plano]["pool"] - outros, 0)
+        elif not current_user.cota_mensal:
             current_user.cota_mensal = 50
         db.session.commit()
         assinatura = asaas("POST", "/subscriptions", {
@@ -1110,7 +1113,11 @@ def admin_plano(uid, plano):
         u.org.creditos_total = PLANOS[plano]["pool"]
         u.org.status = "ativo"     # cortesia: ativa sem pagamento
         u.status = "ativo"
-        if not u.cota_mensal:
+        # dono recebe o pool inteiro menos o que já está com outros membros
+        if plano == "escritorio":
+            outros = sum((m.cota_mensal or 0) for m in u.org.usuarios if m.id != u.id)
+            u.cota_mensal = max(PLANOS[plano]["pool"] - outros, 0)
+        else:
             u.cota_mensal = 50
         db.session.commit()
     return redirect(url_for("admin"))
