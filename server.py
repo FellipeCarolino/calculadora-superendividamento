@@ -569,7 +569,13 @@ def assinar_post():
             db.session.commit()
         else:
             # atualiza os dados (inclui endereço necessário para a nota fiscal)
-            asaas("POST", "/customers/%s" % current_user.asaas_customer_id, dados_cliente)
+            try:
+                asaas("POST", "/customers/%s" % current_user.asaas_customer_id, dados_cliente)
+            except Exception:
+                # cliente pode ter sido excluído no Asaas — cria um novo
+                cliente = asaas("POST", "/customers", dados_cliente)
+                current_user.asaas_customer_id = cliente.get("id")
+                db.session.commit()
         assinatura = asaas("POST", "/subscriptions", {
             "customer": current_user.asaas_customer_id,
             "billingType": "UNDEFINED",
