@@ -474,6 +474,7 @@ def health():
         "ok": True, "model": MODEL,
         "tem_chave": bool(os.environ.get("ANTHROPIC_API_KEY")),
         "banco": dialect, "contas": total_contas,
+        "deploy": "repactua-deploy-check-001",
     })
 
 
