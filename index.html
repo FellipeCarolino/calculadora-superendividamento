@@ -814,6 +814,7 @@
 <body>
 
 <div id="contaBar" style="display:none;background:#13283e;color:#fff;padding:8px 20px;font-size:0.85rem;display:none;align-items:center;gap:14px;justify-content:flex-end">
+  <span id="contaPlano" style="background:#c8960c;color:#13283e;padding:3px 11px;border-radius:14px;font-weight:700;font-size:0.78rem;display:none"></span>
   <span id="contaUso" style="background:rgba(255,255,255,0.12);padding:4px 12px;border-radius:14px"></span>
   <a id="contaAssinar" href="/assinar" style="background:#c8960c;color:#fff;text-decoration:none;font-weight:700;padding:5px 16px;border-radius:14px;display:none">Assinar</a>
   <span id="contaNome"></span>
@@ -3013,6 +3014,11 @@ ${advLinha || '[Advogado(a) — OAB]'}`;
       const bar = document.getElementById('contaBar');
       bar.style.display = 'flex';
       document.getElementById('contaNome').textContent = (u.nome || u.email || '') + (u.status === 'ativo' ? '' : ' · ' + u.status);
+      const plano = document.getElementById('contaPlano');
+      if (plano && u.plano_nome) {
+        plano.textContent = u.plano_nome + (u.papel === 'membro' ? ' · membro' : '');
+        plano.style.display = 'inline';
+      }
       atualizarUsoConta(u.restantes, u.limite);
       if (u.status !== 'ativo') document.getElementById('contaAssinar').style.display = 'inline';
       if (u.is_admin) document.getElementById('contaAdmin').style.display = 'inline';
