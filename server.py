@@ -427,6 +427,18 @@ def _checar_uso():
 # ============================================================
 # Páginas (HTML simples, embutido)
 # ============================================================
+# Logo Repactua reutilizável (selo azul-marinho + setas convergindo douradas)
+def logo_repactua(tam=34):
+    return (f'<svg width="{tam}" height="{tam}" viewBox="0 0 80 80" '
+            'style="vertical-align:middle;flex:none" aria-hidden="true">'
+            '<rect width="80" height="80" rx="18" fill="#1a3a5c"/>'
+            '<polyline points="26,22 38,40 26,58" fill="none" stroke="#c8960c" '
+            'stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>'
+            '<polyline points="54,22 42,40 54,58" fill="none" stroke="#c8960c" '
+            'stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>'
+            '<circle cx="40" cy="40" r="3.5" fill="#c8960c"/></svg>')
+
+
 def _pagina_auth(titulo, corpo):
     return Response(PAGINA_BASE.replace("{{TITULO}}", titulo).replace("{{CORPO}}", corpo), mimetype="text/html")
 
@@ -1025,7 +1037,7 @@ def render_conta(msg_ok="", msg_erro=""):
     </div>"""
 
     corpo = f"""<div class="topo">
-      <h1>👤 Minha Conta</h1>
+      <h1>{logo_repactua(30)} <span>Minha Conta</span></h1>
       <div><a href="/">← Calculadora</a>{' · <a href="/admin">Admin</a>' if u.is_admin else ''} · <a href="/logout">Sair</a></div>
     </div>
     {avisos}{bloco_plano}{bloco_equipe}{bloco_senha}"""
@@ -1228,17 +1240,34 @@ def admin():
             {link_admin}
           </td></tr>"""
     html = f"""<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
-    <title>Admin · Assinantes</title><style>
-    body{{font-family:'Segoe UI',sans-serif;background:#f4f6f9;padding:24px;color:#1c2b3a}}
-    h1{{color:#1a3a5c}} table{{width:100%;border-collapse:collapse;background:#fff;margin-top:16px;box-shadow:0 2px 12px rgba(0,0,0,.08);border-radius:8px;overflow:hidden}}
-    th{{background:#1a3a5c;color:#fff;padding:10px;text-align:left;font-size:.8rem}} td{{padding:10px;border-bottom:1px solid #eee;font-size:.9rem}}
-    a{{color:#2c5f8a;text-decoration:none;font-size:.82rem}} small{{color:#888}}
-    .voltar{{display:inline-block;margin-bottom:12px;color:#2c5f8a;text-decoration:none}}</style></head><body>
-    <a class="voltar" href="/">← Voltar à calculadora</a> &nbsp;·&nbsp;
-    <a class="voltar" href="/admin/logout">Sair do admin ↪</a>
-    <h1>Assinantes ({len(users)})</h1>
-    <table><thead><tr><th>Advogado</th><th>Escritório</th><th>Status</th><th>Uso/mês</th><th>Ações</th></tr></thead>
-    <tbody>{linhas}</tbody></table></body></html>"""
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Painel · Repactua</title><style>
+    *{{box-sizing:border-box;margin:0;padding:0;font-family:'Segoe UI',system-ui,sans-serif}}
+    body{{background:#f4f6f9;color:#1c2b3a}}
+    .barra{{background:#1a3a5c;color:#fff;padding:12px 28px;display:flex;align-items:center;justify-content:space-between}}
+    .barra .marca{{display:flex;align-items:center;gap:10px;font-weight:700;font-size:1.05rem}}
+    .barra .marca small{{display:block;font-weight:400;opacity:.75;font-size:.72rem}}
+    .barra a{{color:#fff;text-decoration:none;font-size:.85rem;opacity:.9;margin-left:16px}}
+    .barra a:hover{{opacity:1;color:#f0b429}}
+    .wrap{{max-width:1100px;margin:0 auto;padding:24px}}
+    h1{{color:#1a3a5c;font-size:1.3rem;margin-bottom:4px}}
+    .sub{{color:#5a6a7a;font-size:.85rem;margin-bottom:16px}}
+    table{{width:100%;border-collapse:collapse;background:#fff;box-shadow:0 2px 14px rgba(0,0,0,.07);border-radius:10px;overflow:hidden}}
+    th{{background:#1a3a5c;color:#fff;padding:11px;text-align:left;font-size:.76rem;text-transform:uppercase;letter-spacing:.4px}}
+    td{{padding:11px;border-bottom:1px solid #eef1f5;font-size:.88rem;vertical-align:top}}
+    tr:hover td{{background:#fafbfd}}
+    a{{color:#1a3a5c;text-decoration:none;font-size:.82rem;font-weight:600}} a:hover{{color:#c8960c}}
+    small{{color:#8a97a5;font-weight:400}}</style></head><body>
+    <div class="barra">
+      <div class="marca">{logo_repactua(30)} <div>Repactua<small>Painel administrativo</small></div></div>
+      <div><a href="/">← Calculadora</a><a href="/admin/logout">Sair do admin ↪</a></div>
+    </div>
+    <div class="wrap">
+      <h1>Assinantes</h1>
+      <div class="sub">{len(users)} conta(s) cadastrada(s)</div>
+      <table><thead><tr><th>Advogado</th><th>Escritório / plano</th><th>Status</th><th>Uso/mês</th><th>Ações</th></tr></thead>
+      <tbody>{linhas}</tbody></table>
+    </div></body></html>"""
     return Response(html, mimetype="text/html")
 
 
