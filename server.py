@@ -429,14 +429,17 @@ def _checar_uso():
 # ============================================================
 # Logo Repactua reutilizável (selo azul-marinho + setas convergindo douradas)
 def logo_repactua(tam=34):
+    # Selo azul-marinho com duas setas convergindo (→ • ←) — conceito "acordo"
     return (f'<svg width="{tam}" height="{tam}" viewBox="0 0 80 80" '
             'style="vertical-align:middle;flex:none" aria-hidden="true">'
             '<rect width="80" height="80" rx="18" fill="#1a3a5c"/>'
-            '<polyline points="26,22 38,40 26,58" fill="none" stroke="#c8960c" '
+            '<line x1="15" y1="40" x2="34" y2="40" stroke="#c8960c" stroke-width="6" stroke-linecap="round"/>'
+            '<polyline points="27,30 37,40 27,50" fill="none" stroke="#c8960c" '
             'stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>'
-            '<polyline points="54,22 42,40 54,58" fill="none" stroke="#c8960c" '
+            '<line x1="65" y1="40" x2="46" y2="40" stroke="#c8960c" stroke-width="6" stroke-linecap="round"/>'
+            '<polyline points="53,30 43,40 53,50" fill="none" stroke="#c8960c" '
             'stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>'
-            '<circle cx="40" cy="40" r="3.5" fill="#c8960c"/></svg>')
+            '<circle cx="40" cy="40" r="3.5" fill="#fff"/></svg>')
 
 
 def _pagina_auth(titulo, corpo):
@@ -590,64 +593,107 @@ def render_home():
     plano_nome = PLANOS.get(plano, {}).get("nome", "Individual")
     usados = (u.usage_contagem or 0) if u.usage_mes == datetime.utcnow().strftime("%Y-%m") else 0
     cota = u.limite_mensal or 0
+    restantes = u.consultas_restantes()
     pct = int(usados * 100 / cota) if cota else 0
-    primeiro_nome = (u.nome or u.email or "").split(" ")[0].split("@")[0]
+    primeiro_nome = (u.nome or u.email or "").split(" ")[0].split("@")[0].capitalize()
+    saudacao = _saudacao_hora()
+    hoje = datetime.utcnow().strftime("%d/%m/%Y")
 
-    # casos recentes do escritório
-    q = Caso.query
-    q = q.filter_by(org_id=u.org_id) if u.org_id else q.filter_by(user_id=u.id)
-    recentes = q.order_by(Caso.atualizado_em.desc()).limit(5).all()
+    # casos do escritório
+    qbase = Caso.query.filter_by(org_id=u.org_id) if u.org_id else Caso.query.filter_by(user_id=u.id)
+    total_casos = qbase.count()
+    recentes = qbase.order_by(Caso.atualizado_em.desc()).limit(6).all()
+
+    # --- Indicadores (metric cards) ---
+    metricas = [
+        ("Consultas restantes", f"{restantes}", f"de {cota} este mês", "/calculadora", ""),
+        ("Casos salvos", f"{total_casos}", "no escritório" if plano == "escritorio" else "na sua conta",
+         "/calculadora?casos=1", ""),
+        ("Plano", plano_nome, ("ativo" if u.status_efetivo == "ativo" else u.status_efetivo), "/conta", ""),
+    ]
+    if plano == "escritorio" and org:
+        metricas.append(("Equipe", f"{org.total_membros}/{org.max_membros}", "acessos em uso",
+                         "/conta", ""))
+    cards_metricas = ""
+    for label, valor, sub, href, _ in metricas:
+        cards_metricas += (f'<a class="metric" href="{href}">'
+                           f'<div class="m-label">{label}</div>'
+                           f'<div class="m-valor">{valor}</div>'
+                           f'<div class="m-sub">{sub}</div></a>')
+
+    # --- Casos recentes ---
     if recentes:
         itens = ""
         for c in recentes:
             quando = (c.atualizado_em or c.criado_em or datetime.utcnow()).strftime("%d/%m/%Y")
+            autor = (c.autor.nome or c.autor.email) if c.autor else ""
+            sub_autor = f' · {autor}' if (plano == "escritorio" and autor) else ""
             itens += (f'<a class="recente" href="/calculadora?caso={c.id}">'
                       f'<span class="r-nome">{(c.nome or "Caso sem nome")}</span>'
-                      f'<span class="r-data">{quando}</span></a>')
-        bloco_recentes = f'<div class="card"><h2>Casos recentes</h2>{itens}'\
-                         f'<a class="vertodos" href="/calculadora?casos=1">Ver todos os casos →</a></div>'
+                      f'<span class="r-data">{quando}{sub_autor}</span></a>')
+        bloco_recentes = (f'<div class="card"><div class="card-h"><h2>Casos recentes</h2>'
+                          f'<a class="vertodos" href="/calculadora?casos=1">Ver todos →</a></div>{itens}</div>')
     else:
         bloco_recentes = ('<div class="card"><h2>Casos recentes</h2>'
-                          '<div class="vazio">Você ainda não salvou nenhum caso. Comece uma nova análise!</div></div>')
+                          '<div class="vazio">Você ainda não salvou nenhum caso. Comece uma <a href="/calculadora">nova análise</a>!</div></div>')
 
     card_equipe = ""
     if u.papel == "dono" and plano == "escritorio":
         card_equipe = ('<a class="atalho" href="/conta">'
                        '<div class="a-ico">👥</div><div class="a-nome">Equipe</div>'
-                       '<div class="a-sub">Gerir membros e créditos</div></a>')
+                       '<div class="a-sub">Membros e créditos</div></a>')
+    alerta = ""
+    if u.status_efetivo != "ativo":
+        alerta = ('<a class="alerta" href="/assinar">⚠️ Sua conta não está ativa. '
+                  'Clique para assinar e liberar as consultas →</a>')
 
     corpo = f"""<div class="topo">
-      <div class="marca">{logo_repactua(34)} <div>Repactua<small>Olá, {primeiro_nome}</small></div></div>
+      <div class="marca">{logo_repactua(36)} <div>Repactua<small>Análise de superendividamento</small></div></div>
       <div class="links"><a href="/conta">Minha conta</a>{' · <a href="/admin">Admin</a>' if u.is_admin else ''} · <a href="/logout">Sair</a></div>
     </div>
 
-    <div class="card uso">
-      <div class="uso-top">
-        <span class="badge-plano">{plano_nome}</span>
-        <span class="uso-num">{usados} de {cota} consultas usadas este mês</span>
+    <div class="hero">
+      <div><h1>{saudacao}, {primeiro_nome} 👋</h1>
+      <div class="hero-sub">Bem-vindo(a) ao seu painel · {hoje}</div></div>
+      <a class="btn-novo" href="/calculadora">+ Nova análise</a>
+    </div>
+    {alerta}
+
+    <div class="metrics">{cards_metricas}</div>
+    <div class="bar-wrap"><div class="bar"><i style="width:{min(pct,100)}%"></i></div>
+      <span class="bar-leg">{usados} de {cota} consultas usadas este mês</span></div>
+
+    <div class="grid2">
+      <div class="card">
+        <h2>Atalhos</h2>
+        <div class="atalhos">
+          <a class="atalho destaque" href="/calculadora">
+            <div class="a-ico">🧮</div><div class="a-nome">Nova análise</div>
+            <div class="a-sub">Calcular superendividamento</div>
+          </a>
+          <a class="atalho" href="/calculadora?casos=1">
+            <div class="a-ico">🗂️</div><div class="a-nome">Meus casos</div>
+            <div class="a-sub">Abrir análises salvas</div>
+          </a>
+          <a class="atalho" href="/conta">
+            <div class="a-ico">⚙️</div><div class="a-nome">Minha conta</div>
+            <div class="a-sub">Plano, senha e dados</div>
+          </a>
+          {card_equipe}
+        </div>
       </div>
-      <div class="bar"><i style="width:{min(pct,100)}%"></i></div>
-      {'' if u.status_efetivo == 'ativo' else '<a class="assinar" href="/assinar">Assinar para liberar →</a>'}
-    </div>
-
-    <div class="atalhos">
-      <a class="atalho destaque" href="/calculadora">
-        <div class="a-ico">🧮</div><div class="a-nome">Nova análise</div>
-        <div class="a-sub">Calcular superendividamento</div>
-      </a>
-      <a class="atalho" href="/calculadora?casos=1">
-        <div class="a-ico">🗂️</div><div class="a-nome">Meus casos</div>
-        <div class="a-sub">Abrir análises salvas</div>
-      </a>
-      <a class="atalho" href="/conta">
-        <div class="a-ico">⚙️</div><div class="a-nome">Minha conta</div>
-        <div class="a-sub">Plano, senha e dados</div>
-      </a>
-      {card_equipe}
-    </div>
-
-    {bloco_recentes}"""
+      {bloco_recentes}
+    </div>"""
     return Response(PAGINA_HOME.replace("{{CORPO}}", corpo), mimetype="text/html")
+
+
+def _saudacao_hora():
+    h = (datetime.utcnow().hour - 3) % 24  # horário de Brasília aproximado
+    if h < 12:
+        return "Bom dia"
+    if h < 18:
+        return "Boa tarde"
+    return "Boa noite"
 
 
 @app.route("/api/me")
@@ -1031,36 +1077,51 @@ PAGINA_HOME = """<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 80 80'%3E%3Crect width='80' height='80' rx='18' fill='%231a3a5c'/%3E%3Cpolyline points='26,22 38,40 26,58' fill='none' stroke='%23c8960c' stroke-width='6' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpolyline points='54,22 42,40 54,58' fill='none' stroke='%23c8960c' stroke-width='6' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='40' cy='40' r='3.5' fill='%23c8960c'/%3E%3C/svg%3E">
 <style>
 *{box-sizing:border-box;margin:0;padding:0;font-family:'Segoe UI',system-ui,sans-serif}
-body{background:#f4f6f9;color:#1c2b3a;padding:24px}
-.wrap{max-width:760px;margin:0 auto}
-.topo{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;flex-wrap:wrap;gap:10px}
-.marca{display:flex;align-items:center;gap:10px;font-weight:700;font-size:1.15rem;color:#1a3a5c}
-.marca small{display:block;font-weight:400;color:#5a6a7a;font-size:.82rem}
+body{background:#eef1f6;color:#1c2b3a;padding:24px}
+.wrap{max-width:880px;margin:0 auto}
+.topo{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;flex-wrap:wrap;gap:10px}
+.marca{display:flex;align-items:center;gap:11px;font-weight:700;font-size:1.18rem;color:#1a3a5c}
+.marca small{display:block;font-weight:400;color:#5a6a7a;font-size:.8rem}
 .links a{color:#2c5f8a;text-decoration:none;font-size:.88rem;font-weight:600}
 .links a:hover{color:#c8960c}
-.card{background:#fff;border-radius:12px;box-shadow:0 2px 14px rgba(0,0,0,.07);padding:20px;margin-bottom:16px}
-.card h2{font-size:1rem;color:#1a3a5c;margin-bottom:12px}
-.uso-top{display:flex;align-items:center;gap:12px;justify-content:space-between;flex-wrap:wrap}
-.badge-plano{background:#c8960c;color:#13283e;padding:3px 12px;border-radius:14px;font-weight:700;font-size:.8rem}
-.uso-num{color:#5a6a7a;font-size:.9rem}
-.bar{height:12px;background:#eef1f5;border-radius:8px;overflow:hidden;margin-top:10px}
+.hero{background:#1a3a5c;color:#fff;border-radius:14px;padding:22px 24px;display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:16px}
+.hero h1{font-size:1.4rem;font-weight:700}
+.hero-sub{color:rgba(255,255,255,.75);font-size:.86rem;margin-top:3px}
+.btn-novo{background:#c8960c;color:#fff;text-decoration:none;font-weight:700;padding:11px 20px;border-radius:9px;font-size:.95rem;white-space:nowrap}
+.btn-novo:hover{background:#f0b429}
+.alerta{display:block;background:#fff4e0;color:#8a5a00;border:1px solid #f0d293;border-radius:10px;padding:12px 16px;margin-bottom:16px;text-decoration:none;font-size:.9rem;font-weight:600}
+.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:12px;margin-bottom:12px}
+.metric{background:#fff;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,.06);padding:16px 18px;text-decoration:none;color:#1c2b3a;border:1.5px solid transparent}
+.metric:hover{border-color:#c8960c}
+.m-label{font-size:.74rem;text-transform:uppercase;letter-spacing:.4px;color:#7a8794;font-weight:600}
+.m-valor{font-size:1.7rem;font-weight:700;color:#1a3a5c;margin:4px 0 1px}
+.m-sub{font-size:.78rem;color:#8a97a5}
+.bar-wrap{background:#fff;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,.06);padding:14px 18px;margin-bottom:16px}
+.bar{height:11px;background:#eef1f5;border-radius:8px;overflow:hidden}
 .bar>i{display:block;height:100%;background:#c8960c;border-radius:8px}
-.assinar{display:inline-block;margin-top:12px;background:#c8960c;color:#fff;padding:8px 16px;border-radius:8px;text-decoration:none;font-weight:700;font-size:.88rem}
-.atalhos{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:12px;margin-bottom:16px}
-.atalho{background:#fff;border-radius:12px;box-shadow:0 2px 14px rgba(0,0,0,.07);padding:18px;text-decoration:none;color:#1c2b3a;border:1.5px solid transparent}
+.bar-leg{display:block;margin-top:8px;font-size:.8rem;color:#5a6a7a}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.card{background:#fff;border-radius:12px;box-shadow:0 2px 14px rgba(0,0,0,.07);padding:20px}
+.card-h{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.card h2{font-size:1rem;color:#1a3a5c;margin-bottom:12px}
+.card-h h2{margin-bottom:0}
+.atalhos{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.atalho{background:#f7f9fc;border-radius:10px;padding:14px;text-decoration:none;color:#1c2b3a;border:1.5px solid transparent}
 .atalho:hover{border-color:#c8960c}
-.atalho.destaque{background:#1a3a5c;color:#fff}
-.a-ico{font-size:1.7rem;line-height:1}
-.a-nome{font-weight:700;margin-top:8px}
+.atalho.destaque{background:#1a3a5c;color:#fff;grid-column:1/-1}
+.a-ico{font-size:1.6rem;line-height:1}
+.a-nome{font-weight:700;margin-top:7px}
 .atalho.destaque .a-sub{color:rgba(255,255,255,.8)}
-.a-sub{font-size:.78rem;color:#5a6a7a;margin-top:2px}
+.a-sub{font-size:.76rem;color:#5a6a7a;margin-top:2px}
 .recente{display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid #f0f3f7;text-decoration:none;color:#1c2b3a}
 .recente:last-of-type{border-bottom:none}
 .recente:hover .r-nome{color:#c8960c}
-.r-nome{font-weight:600;font-size:.9rem}
-.r-data{color:#8a97a5;font-size:.82rem}
-.vertodos{display:inline-block;margin-top:12px;color:#2c5f8a;text-decoration:none;font-weight:600;font-size:.85rem}
-.vazio{color:#5a6a7a;font-size:.88rem}
+.r-nome{font-weight:600;font-size:.88rem}
+.r-data{color:#8a97a5;font-size:.78rem;white-space:nowrap;margin-left:10px}
+.vertodos{color:#2c5f8a;text-decoration:none;font-weight:600;font-size:.82rem}
+.vertodos:hover{color:#c8960c}
+.vazio{color:#5a6a7a;font-size:.88rem}.vazio a{color:#2c5f8a}
+@media(max-width:640px){.grid2{grid-template-columns:1fr}}
 </style></head><body><div class="wrap">{{CORPO}}</div></body></html>"""
 
 
