@@ -1104,8 +1104,15 @@ def admin():
         else:
             extra = ""
         uso_mes = (u.usage_contagem or 0) if u.usage_mes == datetime.utcnow().strftime('%Y-%m') else 0
+        selo_admin = ' <span style="background:#1a3a5c;color:#f0b429;padding:1px 7px;border-radius:10px;font-size:.68rem;font-weight:700">ADMIN</span>' if u.is_admin else ''
+        # protege o admin principal e o próprio admin logado de serem rebaixados
+        protegido = (u.email == ADMIN_EMAIL) or (u.email == session.get("admin_email"))
+        if u.is_admin:
+            link_admin = '<span style="color:#aaa">admin protegido</span>' if protegido else f'<a href="/admin/admin/{u.id}/0">remover admin</a>'
+        else:
+            link_admin = f'<a href="/admin/admin/{u.id}/1">tornar admin</a>'
         linhas += f"""<tr>
-          <td>{u.nome or '—'}<br><small>{u.email}</small></td>
+          <td>{u.nome or '—'}{selo_admin}<br><small>{u.email}</small></td>
           <td>{u.escritorio or '—'}<br><small>{plano} · {papel}</small>{extra}</td>
           <td><b>{u.status_efetivo}</b></td>
           <td>{uso_mes}/{u.limite_mensal}<br><small>cota pessoal</small></td>
@@ -1114,7 +1121,8 @@ def admin():
             <a href="/admin/status/{u.id}/inativo">inativar</a> ·
             <a href="/admin/status/{u.id}/trial">trial</a><br>
             <a href="/admin/plano/{u.id}/escritorio">→ escritório (cortesia)</a> ·
-            <a href="/admin/plano/{u.id}/individual">→ individual</a>
+            <a href="/admin/plano/{u.id}/individual">→ individual</a><br>
+            {link_admin}
           </td></tr>"""
     html = f"""<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
     <title>Admin · Assinantes</title><style>
@@ -1140,6 +1148,23 @@ def admin_status(uid, novo):
         u.status = novo            # legado
         if u.org:
             u.org.status = novo    # fonte de verdade
+        db.session.commit()
+    return redirect(url_for("admin"))
+
+
+@app.route("/admin/admin/<int:uid>/<int:val>")
+def admin_set_admin(uid, val):
+    """Promove (val=1) ou remove (val=0) um usuário como admin do painel."""
+    if not _admin_logado():
+        return redirect(url_for("admin_login"))
+    u = db.session.get(User, uid)
+    if u:
+        if val == 1:
+            u.is_admin = True
+        else:
+            # não permite rebaixar o admin principal nem o admin logado
+            if u.email != ADMIN_EMAIL and u.email != session.get("admin_email"):
+                u.is_admin = False
         db.session.commit()
     return redirect(url_for("admin"))
 
