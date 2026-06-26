@@ -140,6 +140,7 @@ class Escritorio(db.Model):
     asaas_customer_id = db.Column(db.String(120))
     max_membros = db.Column(db.Integer, default=1)
     creditos_total = db.Column(db.Integer, default=50)  # pool de consultas/mês do escritório
+    timbre = db.Column(db.Text)  # JSON do timbre da petição (compartilhado pelo escritório)
     criado_em = db.Column(db.DateTime, default=datetime.utcnow)
 
     usuarios = db.relationship("User", backref="org", lazy=True,
@@ -247,6 +248,7 @@ def _migrar_schema():
         'ALTER TABLE "user" ADD COLUMN papel VARCHAR(20)',
         'ALTER TABLE "user" ADD COLUMN cota_mensal INTEGER',
         'ALTER TABLE escritorio ADD COLUMN creditos_total INTEGER',
+        'ALTER TABLE escritorio ADD COLUMN timbre TEXT',
     ):
         try:
             db.session.execute(text(ddl))
@@ -635,6 +637,32 @@ def casos_excluir(cid):
        (not current_user.org_id and c.user_id != current_user.id):
         return jsonify({"ok": False, "erro": "Caso não encontrado."}), 404
     db.session.delete(c)
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/timbre", methods=["GET"])
+@login_required
+def timbre_obter():
+    org = current_user.org
+    try:
+        cfg = json.loads(org.timbre) if (org and org.timbre) else {}
+    except Exception:
+        cfg = {}
+    return jsonify({"ok": True, "timbre": cfg, "pode_editar": (current_user.papel == "dono")})
+
+
+@app.route("/api/timbre", methods=["POST"])
+@login_required
+def timbre_salvar():
+    org = current_user.org
+    if not org:
+        return jsonify({"ok": False, "erro": "Sem escritório."}), 400
+    if current_user.papel != "dono":
+        return jsonify({"ok": False, "erro": "Apenas o dono do escritório pode editar o timbre."}), 403
+    body = request.get_json(silent=True) or {}
+    cfg = {k: body.get(k, "") for k in ("nome", "advogado", "oab", "contato", "logo")}
+    org.timbre = json.dumps(cfg)
     db.session.commit()
     return jsonify({"ok": True})
 

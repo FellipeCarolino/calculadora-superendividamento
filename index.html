@@ -894,7 +894,7 @@
         <button class="btn btn-primary" onclick="salvarCaso()">💾 Salvar atual</button>
       </div>
       <div id="listaCasos"></div>
-      <p style="font-size:0.75rem;color:var(--text-muted);margin-top:12px">Os casos ficam salvos apenas neste navegador (localStorage). Ao carregar um caso, os dados atuais do formulário são substituídos.</p>
+      <p style="font-size:0.75rem;color:var(--text-muted);margin-top:12px">Os casos ficam salvos no servidor e são compartilhados pelo escritório — acessíveis de qualquer computador. Ao carregar um caso, os dados atuais do formulário são substituídos.</p>
     </div>
   </div>
 </div>
@@ -2628,16 +2628,28 @@
   }
 
   // ============================================================
-  // ESCRITÓRIO (timbre) — localStorage
+  // ESCRITÓRIO (timbre) — no servidor, compartilhado pelo escritório
   // ============================================================
   let ultimoCalculo = null;
 
   function abrirModal(id) { document.getElementById(id).classList.add('aberto'); }
   function fecharModal(id) { document.getElementById(id).classList.remove('aberto'); }
 
-  function getEscritorio() {
-    try { return JSON.parse(localStorage.getItem('escritorio_config')) || {}; }
-    catch { return {}; }
+  // Timbre NO SERVIDOR (compartilhado pelo escritório). Cache local p/ leitura síncrona.
+  let ESCRITORIO_CFG = {};
+  let TIMBRE_PODE_EDITAR = true;
+
+  function getEscritorio() { return ESCRITORIO_CFG; }
+
+  async function carregarTimbreServidor() {
+    try {
+      const r = await fetch('/api/timbre');
+      const data = await r.json();
+      ESCRITORIO_CFG = (data && data.timbre) || {};
+      TIMBRE_PODE_EDITAR = !data || data.pode_editar !== false;
+    } catch { ESCRITORIO_CFG = {}; }
+    preencherTimbre();
+    try { carregarEscritorioNoModal(); } catch {}
   }
 
   function carregarLogo(input) {
@@ -2652,7 +2664,7 @@
     reader.readAsDataURL(file);
   }
 
-  function salvarEscritorio() {
+  async function salvarEscritorio() {
     const img = document.getElementById('escLogoPreview');
     const cfg = {
       nome: document.getElementById('escNome').value.trim(),
@@ -2662,9 +2674,12 @@
       logo: img.style.display !== 'none' ? img.src : '',
     };
     try {
-      localStorage.setItem('escritorio_config', JSON.stringify(cfg));
-    } catch (e) {
-      alert('Não foi possível salvar (a logo pode ser grande demais). Tente uma imagem menor.');
+      const r = await fetch('/api/timbre', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg) });
+      if (r.status === 403) { alert('Apenas o dono do escritório pode editar o timbre.'); return; }
+      if (!r.ok) throw new Error();
+      ESCRITORIO_CFG = cfg;
+    } catch {
+      alert('Não foi possível salvar o timbre. Verifique sua conexão (a logo pode ser grande demais — tente uma imagem menor).');
       return;
     }
     preencherTimbre();
@@ -2694,7 +2709,7 @@
   }
 
   // ============================================================
-  // CASOS SALVOS — localStorage
+  // CASOS SALVOS — no servidor
   // ============================================================
   const CAMPOS_FORMULARIO = [
     'nome','rendaBruta','descINSS','descPensao','descOutros','descConsignado',
@@ -3022,7 +3037,7 @@ ${advLinha || '[Advogado(a) — OAB]'}`;
   alternarIR();
   recalcDespesas();
   carregarEscritorioNoModal();
-  preencherTimbre();
+  carregarTimbreServidor();
 </script>
 </body>
 </html>
