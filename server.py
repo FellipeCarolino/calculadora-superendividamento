@@ -138,6 +138,7 @@ class Escritorio(db.Model):
     plano = db.Column(db.String(20), default="individual")  # individual | escritorio
     status = db.Column(db.String(20), default="trial")      # trial | ativo | inativo
     asaas_customer_id = db.Column(db.String(120))
+    asaas_subscription_id = db.Column(db.String(120))  # p/ trocar de plano (upgrade)
     max_membros = db.Column(db.Integer, default=1)
     creditos_total = db.Column(db.Integer, default=50)  # pool de consultas/mês do escritório
     timbre = db.Column(db.Text)  # JSON do timbre da petição (compartilhado pelo escritório)
@@ -249,6 +250,7 @@ def _migrar_schema():
         'ALTER TABLE "user" ADD COLUMN cota_mensal INTEGER',
         'ALTER TABLE escritorio ADD COLUMN creditos_total INTEGER',
         'ALTER TABLE escritorio ADD COLUMN timbre TEXT',
+        'ALTER TABLE escritorio ADD COLUMN asaas_subscription_id VARCHAR(120)',
     ):
         try:
             db.session.execute(text(ddl))
@@ -420,7 +422,11 @@ def _checar_uso():
     if current_user.status_efetivo == "inativo":
         return False, "Sua assinatura está inativa. Regularize o pagamento para usar a leitura por IA."
     if current_user.consultas_restantes() <= 0:
-        return False, f"Você atingiu o limite de {current_user.limite_mensal} consultas neste mês."
+        msg = f"Você atingiu o limite de {current_user.limite_mensal} consultas neste mês."
+        org = current_user.org
+        if current_user.papel == "dono" and org and org.plano == "individual":
+            msg += " Faça upgrade para o plano Escritório em 'Minha conta' e tenha um pool de 250 consultas/mês."
+        return False, msg
     return True, None
 
 
@@ -1000,6 +1006,8 @@ def assinar_post():
             "cycle": "MONTHLY",
             "description": PLANOS[plano]["desc"],
         })
+        org.asaas_subscription_id = assinatura.get("id")
+        db.session.commit()
         # Configura emissão automática de nota fiscal para a assinatura (se ativado)
         if NF_AUTO and (NF_SERVICO_ID or NF_SERVICO_CODIGO or NF_SERVICO_NOME):
             cfg_nf = {
@@ -1069,6 +1077,9 @@ input[type=text],input[type=email],input[type=password],input[type=number]{paddi
 .ok{background:#e9f7ee;color:#1b5e20;border:1px solid #7ec891;border-radius:8px;padding:10px 14px;font-size:.85rem;margin-bottom:14px}
 .erro{background:#fdecea;color:#7a2218;border:1px solid #e8a49a;border-radius:8px;padding:10px 14px;font-size:.85rem;margin-bottom:14px}
 .pool{background:#fffaf0;border:1px solid #f0d9a0;border-radius:8px;padding:12px;margin-bottom:12px;font-size:.9rem}
+.upgrade-box{background:#fffaf0;border:1px solid #f0d9a0;border-radius:10px;padding:14px;margin-top:14px;font-size:.9rem}
+.upgrade-box .btn{background:#c8960c;color:#fff;border:none;border-radius:8px;padding:10px 16px;font-weight:700;cursor:pointer;font-size:.9rem}
+.upgrade-box .btn:hover{background:#f0b429}
 </style></head><body><div class="wrap">{{CORPO}}</div></body></html>"""
 
 
@@ -1130,6 +1141,23 @@ def _badge(status):
     return f'<span class="badge {cls}">{status.upper()}</span>'
 
 
+def _bloco_upgrade(u, plano):
+    """CTA de upgrade para Escritório, mostrado ao dono de um plano Individual."""
+    if plano != "individual" or u.papel != "dono":
+        return ""
+    valor = ('%.2f' % PLANOS["escritorio"]["valor"]).replace('.', ',')
+    return (
+        '<div class="upgrade-box">'
+        '<div><b>Precisa de mais consultas ou de uma equipe?</b>'
+        f'<div class="muted" style="margin-top:3px">Suba para o <b>Escritório</b>: pool de <b>250 consultas/mês</b>, '
+        f'até <b>5 acessos</b> e gestão de equipe. Por R$ {valor}/mês.</div></div>'
+        '<form method="post" action="/conta/upgrade" style="margin-top:10px" '
+        'onsubmit="return confirm(\'Confirmar upgrade para o plano Escritório? A próxima cobrança passará para R$ ' + valor + '.\')">'
+        '<button class="btn" type="submit">⬆️ Fazer upgrade para Escritório</button></form>'
+        '</div>'
+    )
+
+
 def render_conta(msg_ok="", msg_erro=""):
     u = current_user
     org = u.org
@@ -1149,6 +1177,7 @@ def render_conta(msg_ok="", msg_erro=""):
       <div class="bar"><i style="width:{min(pct,100)}%"></i></div>
       <div class="muted" style="margin-top:8px">As consultas renovam todo mês.{' ' if u.status_efetivo=='ativo' else ' Assine para liberar 50/mês.'}</div>
       {'' if u.status_efetivo=='ativo' else '<div class="row" style="margin-top:10px"><a class="btn" href="/assinar" style="text-decoration:none">Assinar agora →</a></div>'}
+      {_bloco_upgrade(u, plano)}
     </div>"""
 
     bloco_equipe = ""
@@ -1303,6 +1332,50 @@ def conta_membro_remover(mid):
     db.session.delete(m)
     db.session.commit()
     return render_conta(msg_ok="Membro removido.")
+
+
+def _trocar_plano_assinatura(org, novo_plano):
+    """Atualiza a assinatura no Asaas (valor do novo plano) e o escritório local."""
+    sub_id = org.asaas_subscription_id
+    if not sub_id and org.asaas_customer_id:
+        try:
+            r = asaas("GET", "/subscriptions?customer=%s" % org.asaas_customer_id)
+            data = r.get("data") or []
+            ativas = [s for s in data if s.get("status") == "ACTIVE"] or data
+            if ativas:
+                sub_id = ativas[0].get("id")
+                org.asaas_subscription_id = sub_id
+        except Exception:
+            pass
+    if sub_id:
+        try:
+            asaas("PUT", "/subscriptions/%s" % sub_id, {
+                "value": valor_cobranca(novo_plano),
+                "description": PLANOS[novo_plano]["desc"],
+                "updatePendingPayments": True,
+            })
+        except Exception:
+            pass  # não trava o upgrade local se a API falhar
+    org.plano = novo_plano
+    org.max_membros = PLANOS[novo_plano]["max_membros"]
+    org.creditos_total = PLANOS[novo_plano]["pool"]
+
+
+@app.route("/conta/upgrade", methods=["POST"])
+@login_required
+def conta_upgrade():
+    org = current_user.org
+    if not org or current_user.papel != "dono":
+        return render_conta(msg_erro="Apenas o dono da conta pode mudar o plano.")
+    if org.plano == "escritorio":
+        return render_conta(msg_erro="Você já está no plano Escritório.")
+    _trocar_plano_assinatura(org, "escritorio")
+    # o dono recebe o pool inteiro menos o que já estiver com outros membros
+    outros = sum((m.cota_mensal or 0) for m in org.usuarios if m.id != current_user.id)
+    current_user.cota_mensal = max(PLANOS["escritorio"]["pool"] - outros, 0)
+    db.session.commit()
+    valor = ('%.2f' % valor_cobranca("escritorio")).replace('.', ',')
+    return render_conta(msg_ok=f"Upgrade para o plano Escritório concluído! Pool de 250 consultas/mês e até 5 acessos. A próxima cobrança será de R$ {valor}.")
 
 
 # ============================================================
