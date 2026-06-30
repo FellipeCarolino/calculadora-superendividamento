@@ -1664,6 +1664,69 @@ def admin_subconta():
     return Response(html, mimetype="text/html")
 
 
+@app.route("/admin/configurar-webhook", methods=["GET", "POST"])
+def admin_config_webhook():
+    """Confirma a conta Asaas ativa e cria/lista o webhook (usa o ASAAS_API_KEY atual)."""
+    if not _admin_logado():
+        return redirect(url_for("admin_login"))
+    msg = ""
+    if request.method == "POST":
+        try:
+            r = asaas("POST", "/webhooks", {
+                "name": "Repactua",
+                "url": "https://repactua.com.br/api/asaas-webhook",
+                "enabled": True,
+                "interrupted": False,
+                "authToken": ASAAS_WEBHOOK_TOKEN,
+                "sendType": "SEQUENTIALLY",
+                "events": ["PAYMENT_CONFIRMED", "PAYMENT_RECEIVED", "PAYMENT_OVERDUE",
+                           "PAYMENT_DELETED", "PAYMENT_REFUNDED"],
+            })
+            msg = f'<div class="ok"><b>Webhook configurado!</b> id: {r.get("id","")}</div>'
+        except Exception as e:
+            msg = f'<div class="erro">Erro ao criar webhook: {str(e)[:400]}</div>'
+
+    # confirma a conta ativa e lista webhooks existentes
+    try:
+        conta = asaas("GET", "/myAccount")
+    except Exception:
+        conta = {}
+    nome = conta.get("name") or conta.get("companyName") or "?"
+    email = conta.get("email") or "?"
+    wallet = conta.get("walletId") or "?"
+    try:
+        whs = asaas("GET", "/webhooks").get("data") or []
+    except Exception:
+        whs = []
+    lista_wh = "".join(f'<li>{w.get("url")} · {"ativo" if w.get("enabled") else "inativo"}</li>' for w in whs) or "<li>(nenhum)</li>"
+
+    html = f"""<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Webhook · Repactua</title><style>
+    body{{font-family:'Segoe UI',sans-serif;background:#f4f6f9;color:#1c2b3a;padding:24px}}
+    .wrap{{max-width:620px;margin:0 auto}} h1{{color:#1a3a5c;font-size:1.3rem}}
+    .card{{background:#fff;border-radius:12px;box-shadow:0 2px 14px rgba(0,0,0,.07);padding:22px;margin-top:14px}}
+    .ok{{background:#e9f7ee;color:#1b5e20;border:1px solid #7ec891;border-radius:8px;padding:12px;margin-bottom:12px;font-size:.88rem}}
+    .erro{{background:#fdecea;color:#7a2218;border:1px solid #e8a49a;border-radius:8px;padding:12px;margin-bottom:12px;font-size:.85rem}}
+    .btn{{background:#c8960c;color:#fff;border:none;border-radius:8px;padding:12px 20px;font-weight:700;cursor:pointer;margin-top:8px}}
+    a{{color:#2c5f8a;text-decoration:none}} table td{{padding:5px 8px;font-size:.9rem}} li{{font-size:.85rem;margin:3px 0}}</style></head>
+    <body><div class="wrap"><a href="/admin">← Voltar ao painel</a>
+    <h1 style="margin-top:8px">Configurar webhook da conta Asaas</h1>
+    {msg}
+    <div class="card">
+      <b>Conta Asaas atual (pela ASAAS_API_KEY):</b>
+      <table><tr><td>Nome</td><td><b>{nome}</b></td></tr>
+      <tr><td>E-mail</td><td>{email}</td></tr>
+      <tr><td>Wallet</td><td style="font-family:monospace;font-size:.82rem">{wallet}</td></tr></table>
+      <p style="font-size:.82rem;color:#5a6a7a;margin-top:8px">Confirme que é a subconta do Repactua (não a conta-mãe).</p>
+    </div>
+    <div class="card">
+      <b>Webhooks cadastrados nesta conta:</b><ul>{lista_wh}</ul>
+      <form method="post"><button class="btn" type="submit">Criar/registrar webhook do Repactua</button></form>
+      <p style="font-size:.8rem;color:#5a6a7a;margin-top:8px">Aponta para https://repactua.com.br/api/asaas-webhook com o token já configurado.</p>
+    </div></div></body></html>"""
+    return Response(html, mimetype="text/html")
+
+
 if __name__ == "__main__":
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print("\n⚠️  ANTHROPIC_API_KEY não definida. A leitura por IA não vai funcionar.\n")
