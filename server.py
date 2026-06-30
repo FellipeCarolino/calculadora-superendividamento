@@ -1505,7 +1505,7 @@ def admin():
     small{{color:#8a97a5;font-weight:400}}</style></head><body>
     <div class="barra">
       <div class="marca">{logo_repactua(30)} <div>Repactua<small>Painel administrativo</small></div></div>
-      <div><a href="/calculadora">← Calculadora</a><a href="/admin/logout">Sair do admin ↪</a></div>
+      <div><a href="/admin/subconta">Criar subconta</a><a href="/calculadora">← Calculadora</a><a href="/admin/logout">Sair do admin ↪</a></div>
     </div>
     <div class="wrap">
       <h1>Assinantes</h1>
@@ -1566,6 +1566,97 @@ def admin_plano(uid, plano):
             u.cota_mensal = 50
         db.session.commit()
     return redirect(url_for("admin"))
+
+
+@app.route("/admin/subconta", methods=["GET", "POST"])
+def admin_subconta():
+    """Cria uma subconta no Asaas (POST /accounts). Mostra apiKey/walletId uma única vez."""
+    if not _admin_logado():
+        return redirect(url_for("admin_login"))
+    msg = ""
+    if request.method == "POST":
+        payload = {
+            "name": (request.form.get("name") or "").strip(),
+            "email": (request.form.get("email") or "").strip().lower(),
+            "cpfCnpj": "".join(filter(str.isdigit, request.form.get("cpfCnpj") or "")),
+            "companyType": request.form.get("companyType") or "LIMITED",
+            "phone": "".join(filter(str.isdigit, request.form.get("phone") or "")),
+            "mobilePhone": "".join(filter(str.isdigit, request.form.get("mobilePhone") or "")),
+            "address": (request.form.get("address") or "").strip(),
+            "addressNumber": (request.form.get("addressNumber") or "").strip(),
+            "complement": (request.form.get("complement") or "").strip(),
+            "province": (request.form.get("province") or "").strip(),
+            "postalCode": "".join(filter(str.isdigit, request.form.get("postalCode") or "")),
+        }
+        try:
+            r = asaas("POST", "/accounts", payload)
+            api_key = r.get("apiKey", "")
+            wallet = r.get("walletId", "")
+            acc_id = r.get("id", "")
+            msg = f"""<div class="ok"><b>Subconta criada com sucesso!</b> 🎉<br>
+              Copie agora (a chave aparece só uma vez):</div>
+              <table style="margin-top:8px"><tbody>
+              <tr><td><b>API Key</b></td><td style="font-family:monospace;word-break:break-all">{api_key}</td></tr>
+              <tr><td><b>Wallet ID</b></td><td style="font-family:monospace">{wallet}</td></tr>
+              <tr><td><b>Account ID</b></td><td style="font-family:monospace">{acc_id}</td></tr>
+              </tbody></table>
+              <div class="sub" style="margin-top:10px">⚠️ Guarde a <b>API Key</b> em local seguro. Próximo passo: trocar a variável
+              <code>ASAAS_API_KEY</code> no Railway por esta chave, e configurar a NF e o webhook na subconta.</div>"""
+        except Exception as e:
+            msg = f'<div class="erro">Erro ao criar subconta: {str(e)[:500]}</div>'
+
+    # valores pré-preenchidos com os dados da Sorvezene (editáveis)
+    d = {
+        "name": "Repactua", "email": "", "cpfCnpj": "67.028.638/0001-01",
+        "phone": "(51) 9019-2409", "mobilePhone": "(51) 9019-2409",
+        "address": "Avenida Taquara", "addressNumber": "193", "complement": "",
+        "province": "Petrópolis", "postalCode": "90460-210",
+    }
+    html = f"""<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Criar subconta · Repactua</title><style>
+    *{{box-sizing:border-box;margin:0;padding:0;font-family:'Segoe UI',system-ui,sans-serif}}
+    body{{background:#f4f6f9;color:#1c2b3a}} .wrap{{max-width:620px;margin:0 auto;padding:24px}}
+    h1{{color:#1a3a5c;font-size:1.3rem;margin-bottom:4px}} .sub{{color:#5a6a7a;font-size:.85rem;margin-bottom:16px}}
+    .card{{background:#fff;border-radius:12px;box-shadow:0 2px 14px rgba(0,0,0,.07);padding:22px}}
+    label{{display:block;font-size:.74rem;text-transform:uppercase;color:#5a6a7a;font-weight:600;margin:12px 0 4px}}
+    input,select{{width:100%;padding:10px 12px;border:1.5px solid #d0d7e2;border-radius:8px;font-size:.92rem;background:#fafbfd}}
+    .row{{display:flex;gap:10px}} .row>div{{flex:1}}
+    .btn{{margin-top:18px;background:#c8960c;color:#fff;border:none;border-radius:8px;padding:12px 20px;font-weight:700;cursor:pointer;font-size:.95rem}}
+    .ok{{background:#e9f7ee;color:#1b5e20;border:1px solid #7ec891;border-radius:8px;padding:12px 14px;font-size:.88rem;margin-bottom:14px}}
+    .erro{{background:#fdecea;color:#7a2218;border:1px solid #e8a49a;border-radius:8px;padding:12px 14px;font-size:.85rem;margin-bottom:14px}}
+    table td{{padding:6px 8px;border-bottom:1px solid #eef1f5;font-size:.85rem}}
+    a{{color:#2c5f8a;text-decoration:none}} code{{background:#eef1f5;padding:1px 5px;border-radius:4px;font-size:.85rem}}</style></head>
+    <body><div class="wrap">
+    <a href="/admin">← Voltar ao painel</a>
+    <h1 style="margin-top:10px">Criar subconta no Asaas</h1>
+    <div class="sub">Cria uma subconta (POST /accounts) para separar o recebimento do Repactua. Confira os dados e informe um <b>e-mail diferente</b> do da conta-mãe.</div>
+    {msg}
+    <div class="card"><form method="post">
+      <label>Nome da subconta</label><input name="name" value="{d['name']}" required>
+      <label>E-mail (precisa ser diferente do e-mail da conta-mãe)</label><input name="email" type="email" placeholder="repactua@sorvezenetechnology.com.br" required>
+      <div class="row">
+        <div><label>CNPJ</label><input name="cpfCnpj" value="{d['cpfCnpj']}" required></div>
+        <div><label>Tipo</label><select name="companyType">
+          <option value="LIMITED" selected>LIMITED (Ltda)</option>
+          <option value="MEI">MEI</option>
+          <option value="INDIVIDUAL">INDIVIDUAL</option>
+          <option value="ASSOCIATION">ASSOCIATION</option>
+        </select></div>
+      </div>
+      <div class="row">
+        <div><label>Telefone</label><input name="phone" value="{d['phone']}"></div>
+        <div><label>Celular</label><input name="mobilePhone" value="{d['mobilePhone']}" required></div>
+      </div>
+      <label>CEP</label><input name="postalCode" value="{d['postalCode']}" required>
+      <div class="row">
+        <div style="flex:3"><label>Endereço</label><input name="address" value="{d['address']}" required></div>
+        <div><label>Número</label><input name="addressNumber" value="{d['addressNumber']}" required></div>
+      </div>
+      <label>Complemento</label><input name="complement" value="{d['complement']}">
+      <label>Bairro</label><input name="province" value="{d['province']}" required>
+      <button class="btn" type="submit" onclick="return confirm('Criar a subconta no Asaas com estes dados?')">Criar subconta</button>
+    </form></div></div></body></html>"""
+    return Response(html, mimetype="text/html")
 
 
 if __name__ == "__main__":
